@@ -94,6 +94,54 @@ fn a_directory_has_one_writer_at_a_time() {
     assert!(target.join("package.json").is_file());
 }
 
+/// A store entry's path under `store`, in the layout the anchored
+/// placement recognises.
+#[cfg(unix)]
+fn write_store_entry(store: &Path, index: usize) -> PathBuf {
+    let path = store.join(format!("files/1b/{index:040x}"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, format!("payload {index}")).unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_import_links_store_entries_into_every_directory() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempdir().unwrap();
+    let store = root.path().join("store");
+    // `deep/er/index.js` has no entry in `deep`, so no `deep` of its own to
+    // create first.
+    let entries =
+        ["package.json", "index.js", "lib/index.js", "lib/esm/index.js", "deep/er/index.js"];
+    let mut cas_paths: HashMap<String, PathBuf> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.to_string(), write_store_entry(&store, index)))
+        .collect();
+    let local_file = root.path().join("local.js");
+    fs::write(&local_file, "local").unwrap();
+    cas_paths.insert("lib/local.js".to_string(), local_file);
+    let target = root.path().join("pkg");
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Hardlink,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    for (entry, store_path) in &cas_paths {
+        let placed = fs::metadata(target.join(entry)).unwrap();
+        let source = fs::metadata(store_path).unwrap();
+        assert_eq!((placed.dev(), placed.ino()), (source.dev(), source.ino()), "{entry}");
+    }
+}
+
 #[test]
 fn entries_are_grouped_by_the_directory_they_land_in() {
     let cas_paths: HashMap<String, PathBuf> =
@@ -104,10 +152,11 @@ fn entries_are_grouped_by_the_directory_they_land_in() {
 
     let groups: BTreeSet<BTreeSet<&str>> = entries_by_target_dir(&cas_paths, Some("package.json"))
         .iter()
-        .map(|entries| {
-            entries
+        .map(|group| {
+            group.entries
                 .iter()
                 .map(|(entry, store_path)| {
+                    assert_eq!(group.target_dir, Path::new(entry).parent());
                     assert_eq!(*store_path, cas_paths[*entry]);
                     *entry
                 })
@@ -277,4 +326,61 @@ fn final_link_target_points_into_the_final_directory() {
         final_link_target(Path::new("/stage/link"), Path::new("sub/dir"), roots),
         PathBuf::from("/pkg/sub/dir"),
     );
+}
+
+/// A store entry another umask wrote is not placed at its own mode,
+/// whichever of the anchored and the by-path import finishes it.
+#[cfg(unix)]
+fn assert_fresh_import_gives_the_desired_mode(import_method: PackageImportMethod) {
+    use pnpm_fs::file_mode::{current_umask, store_entry_mode};
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempdir().unwrap();
+    let store = root.path().join("store");
+    let entries = ["package.json", "index.js", "lib/index.js"];
+    let cas_paths: HashMap<String, PathBuf> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.to_string(), write_store_entry(&store, index)))
+        .collect();
+    for store_path in cas_paths.values() {
+        fs::set_permissions(store_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let target = root.path().join("pkg");
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        import_method,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    let desired = store_entry_mode(false, current_umask());
+    for entry in entries {
+        let mode = fs::metadata(target.join(entry))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, desired, "{entry}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_hardlink_import_gives_a_foreign_mode_entry_the_desired_mode() {
+    assert_fresh_import_gives_the_desired_mode(PackageImportMethod::Hardlink);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "needs a filesystem that reflinks, which the ext4 of CI is not"
+)]
+#[test]
+fn a_fresh_clone_import_gives_a_foreign_mode_entry_the_desired_mode() {
+    assert_fresh_import_gives_the_desired_mode(PackageImportMethod::Clone);
 }

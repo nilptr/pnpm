@@ -9,6 +9,8 @@ pub use copy_file_exclusive::{
     copy_permissions, read_file_permissions, set_file_permissions,
 };
 pub use cross_device::is_cross_device;
+#[cfg(unix)]
+pub use dir_handle::DirHandle;
 pub use dir_lock::DirLock;
 pub use ensure_file::*;
 #[cfg(not(target_os = "wasi"))]
@@ -51,6 +53,8 @@ mod capabilities;
 mod copy_dirent;
 mod copy_file_exclusive;
 mod cross_device;
+#[cfg(unix)]
+mod dir_handle;
 mod dir_lock;
 mod ensure_file;
 #[cfg(not(target_os = "wasi"))]

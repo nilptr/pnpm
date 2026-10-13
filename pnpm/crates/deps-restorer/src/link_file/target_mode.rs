@@ -26,7 +26,7 @@ pub(super) fn desired_permissions(source_file: &Path) -> io::Result<pnpm_fs::Cop
 /// `None` for a file of a local-directory dependency, which keeps the
 /// mode its project gives it (see [`pnpm_fs::file_mode::is_cas_file_path`]).
 #[cfg(any(unix, target_os = "wasi"))]
-fn desired_mode(source_file: &Path) -> Option<u32> {
+pub(super) fn desired_mode(source_file: &Path) -> Option<u32> {
     pnpm_fs::file_mode::is_cas_file_path(source_file)
         .then(|| {
             pnpm_fs::file_mode::store_entry_mode(

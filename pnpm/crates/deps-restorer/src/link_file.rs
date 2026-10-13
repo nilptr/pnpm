@@ -369,6 +369,20 @@ impl ImportState {
     }
 }
 
+#[cfg(unix)]
+impl ImportState {
+    /// The tier `method` resolves to for the next file.
+    fn current_tier(&self, method: PackageImportMethod) -> u8 {
+        match method {
+            PackageImportMethod::Auto => self.auto.load(Ordering::Relaxed),
+            PackageImportMethod::Hardlink => LINK_STATE_HARDLINK,
+            PackageImportMethod::Clone => LINK_STATE_CLONE,
+            PackageImportMethod::CloneOrCopy => self.clone_or_copy.load(Ordering::Relaxed),
+            PackageImportMethod::Copy => LINK_STATE_COPY,
+        }
+    }
+}
+
 impl Default for ImportState {
     fn default() -> Self {
         Self::new()
@@ -427,9 +441,10 @@ fn try_import<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
     source_file: &Path,
     target_link: &Path,
 ) -> io::Result<WireImportMethod> {
-    static STATE: ImportState = ImportState::new();
-    STATE.import::<Reporter, Sys>(method, logged, source_file, target_link)
+    NPM_IMPORT_STATE.import::<Reporter, Sys>(method, logged, source_file, target_link)
 }
+
+static NPM_IMPORT_STATE: ImportState = ImportState::new();
 
 /// Materialize `source_file` at `target_link` for the copy tier.
 ///
@@ -636,6 +651,8 @@ fn clone_or_copy_link<Reporter: self::Reporter, Sys: FsReflink>(
     }
 }
 
+#[cfg(unix)]
+pub(crate) mod anchored;
 mod target_mode;
 
 #[cfg(test)]

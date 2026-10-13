@@ -72,7 +72,7 @@ pub fn current_umask() -> u32 {
 /// `cast_lossless` on macOS and `u32::from` is `useless_conversion` on
 /// Linux.
 #[cfg(unix)]
-fn widen_mode(mode: impl Into<u32>) -> u32 {
+pub(crate) fn widen_mode(mode: impl Into<u32>) -> u32 {
     mode.into()
 }
 

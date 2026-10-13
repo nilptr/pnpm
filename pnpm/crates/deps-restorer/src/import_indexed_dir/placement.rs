@@ -1,7 +1,13 @@
+#[cfg(unix)]
+mod anchored;
+#[cfg(not(unix))]
+#[path = "placement/unanchored.rs"]
+mod anchored;
 pub(super) mod symlinks;
 
 use super::{ImportIndexedDirError, Placement, remove_non_dir_dirent, staging::import_atomic};
 use crate::import_into_fresh_target;
+use anchored::PackageAnchors;
 use pnpm_config::PackageImportMethod;
 use pnpm_fs::Host;
 use pnpm_reporter::Reporter;
@@ -36,7 +42,7 @@ pub(super) fn populate_dir<Reporter: self::Reporter>(
     placement: Placement,
     symlinks_final_dir: Option<&Path>,
 ) -> Result<(), ImportIndexedDirError> {
-    create_indexed_dirs(dir_path, cas_paths, placement)?;
+    let anchors = create_indexed_dirs(dir_path, cas_paths, placement)?;
     let imported = symlinks_final_dir.map(|_| imported_paths(cas_paths));
     let symlinks = symlinks_final_dir
         .zip(imported.as_ref())
@@ -46,24 +52,19 @@ pub(super) fn populate_dir<Reporter: self::Reporter>(
     // interrupted import leaves a directory the next install recognises
     // as incomplete (pnpm's `tryImportIndexedDir`).
     let marker = marker_file(cas_paths);
+    let placing = EntryPlacing {
+        placement,
+        logged_methods,
+        import_method,
+        dir_path,
+        symlinks,
+        // A symlink entry is recognised by inspecting its source, which
+        // only the by-path placement does.
+        anchors: anchors.as_ref().filter(|_| symlinks.is_none()),
+    };
     entries_by_target_dir(cas_paths, marker)
         .par_iter()
-        .try_for_each(|entries| {
-            entries
-                .iter()
-                .try_for_each(|(cleaned_entry, store_path)| {
-                    #[cfg(test)]
-                    let _writer = tests::DirectoryWriters::enter(dir_path, cleaned_entry);
-                    place_entry::<Reporter>(
-                        placement,
-                        logged_methods,
-                        import_method,
-                        store_path,
-                        &dir_path.join(cleaned_entry),
-                        symlinks,
-                    )
-                })
-        })?;
+        .try_for_each(|group| placing.place::<Reporter>(group))?;
 
     if let Some(marker) = marker {
         place_marker::<Reporter>(
@@ -77,6 +78,61 @@ pub(super) fn populate_dir<Reporter: self::Reporter>(
     }
     Ok(())
 }
+/// How [`populate_dir`] places the entries of one import.
+struct EntryPlacing<'a> {
+    placement: Placement,
+    logged_methods: &'a AtomicU8,
+    import_method: PackageImportMethod,
+    dir_path: &'a Path,
+    symlinks: Option<SymlinkRoots<'a>>,
+    anchors: Option<&'a PackageAnchors<'a>>,
+}
+
+impl EntryPlacing<'_> {
+    /// Place `group` entry after entry, through its open directory where
+    /// that works and by path where it does not.
+    fn place<Reporter: self::Reporter>(
+        &self,
+        group: &TargetDirEntries<'_>,
+    ) -> Result<(), ImportIndexedDirError> {
+        let anchored_dir = self.anchors.and_then(|anchors| anchors.target_dir(group.target_dir));
+        group.entries
+            .iter()
+            .try_for_each(|(cleaned_entry, store_path)| {
+                #[cfg(test)]
+                let _writer = tests::DirectoryWriters::enter(self.dir_path, cleaned_entry);
+                let anchored = anchored_dir
+                    .as_ref()
+                    .is_some_and(|dir| {
+                        dir.import::<Reporter>(
+                            self.logged_methods,
+                            self.import_method,
+                            cleaned_entry,
+                            store_path,
+                        )
+                    });
+                if anchored {
+                    return Ok(());
+                }
+                place_entry::<Reporter>(
+                    self.placement,
+                    self.logged_methods,
+                    self.import_method,
+                    store_path,
+                    &self.dir_path.join(cleaned_entry),
+                    self.symlinks,
+                )
+            })
+    }
+}
+
+/// The entries that land in one directory.
+struct TargetDirEntries<'a> {
+    /// Relative to the package.
+    target_dir: Option<&'a Path>,
+    entries: Vec<(&'a str, &'a Path)>,
+}
+
 /// The entries of `cas_paths` other than `marker`, grouped by the
 /// directory they land in.
 ///
@@ -92,7 +148,7 @@ pub(super) fn populate_dir<Reporter: self::Reporter>(
 fn entries_by_target_dir<'a>(
     cas_paths: &'a HashMap<String, PathBuf>,
     marker: Option<&str>,
-) -> Vec<Vec<(&'a str, &'a Path)>> {
+) -> Vec<TargetDirEntries<'a>> {
     let mut groups: HashMap<Option<&Path>, Vec<(&str, &Path)>> = HashMap::new();
     for (cleaned_entry, store_path) in cas_paths {
         if Some(cleaned_entry.as_str()) == marker {
@@ -103,13 +159,18 @@ fn entries_by_target_dir<'a>(
             .or_default()
             .push((cleaned_entry, store_path));
     }
-    groups.into_values().collect()
+    groups
+        .into_iter()
+        .map(|(target_dir, entries)| TargetDirEntries { target_dir, entries })
+        .collect()
 }
-pub(super) fn create_indexed_dirs(
+/// Returns the anchors a fresh placement can place the entries through,
+/// opened here because the directories are created through them too.
+fn create_indexed_dirs<'a>(
     dir_path: &Path,
-    cas_paths: &HashMap<String, PathBuf>,
+    cas_paths: &'a HashMap<String, PathBuf>,
     placement: Placement,
-) -> Result<(), ImportIndexedDirError> {
+) -> Result<Option<PackageAnchors<'a>>, ImportIndexedDirError> {
     let mut rel_dirs: HashSet<&str> = HashSet::new();
     for entry in cas_paths.keys() {
         if let Some(parent) = Path::new(entry).parent()
@@ -130,9 +191,19 @@ pub(super) fn create_indexed_dirs(
             error,
         })?;
 
+    // A repair replaces what is in its way, which is decided by path.
+    let anchors = (placement == Placement::Fresh)
+        .then(|| PackageAnchors::open(dir_path, cas_paths))
+        .flatten();
     let mut ordered: Vec<&str> = rel_dirs.into_iter().collect();
     ordered.sort_by_key(|s| s.len());
     for rel in ordered {
+        if anchors
+            .as_ref()
+            .is_some_and(|anchors| anchors.create_dir(rel))
+        {
+            continue;
+        }
         if placement == Placement::Repair {
             clear_dirent_blocking_dir::<Host>(dir_path, rel)?;
         }
@@ -141,7 +212,7 @@ pub(super) fn create_indexed_dirs(
             .map_err(|error| ImportIndexedDirError::CreateDir { dirname: abs, error })?;
     }
 
-    Ok(())
+    Ok(anchors)
 }
 /// Put one indexed entry at `target`.
 ///
