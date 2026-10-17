@@ -1,7 +1,9 @@
 #[cfg(target_os = "linux")]
 use super::super::AUTO_FIRST_TIER;
 use super::{
-    super::{Host, LINK_STATE_HARDLINK, LinkFileError, auto_link, link_file, try_import},
+    super::{
+        Host, LINK_STATE_HARDLINK, LinkFileError, PathImport, auto_link, link_file, try_import,
+    },
     OutOfLinks, write_source,
 };
 #[cfg(unix)]
@@ -168,8 +170,12 @@ fn auto_hardlink_tier_call_errors_propagate() {
     let src = tmp.path().join("does-not-exist");
     let dst = tmp.path().join("dst");
 
-    let err = auto_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("missing source → NotFound");
+    let err = auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<Host>::new(&src, &dst),
+    )
+    .expect_err("missing source → NotFound");
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
     assert_eq!(
         state.load(Ordering::Relaxed),
@@ -190,7 +196,7 @@ fn auto_fresh_state_hardlinks_on_linux() {
     let src = write_source(tmp.path(), "src.txt", b"first-tier");
     let dst = tmp.path().join("dst.txt");
 
-    auto_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
+    auto_link::<SilentReporter, _>(&AtomicU8::new(0), &state, &PathImport::<Host>::new(&src, &dst))
         .expect("hardlink should succeed on same-FS tempdir");
 
     assert_eq!(
@@ -213,8 +219,12 @@ fn eperm_from_hard_link_downgrades_the_auto_ladder() {
     let dst = tmp.path().join("nested/dst.txt");
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
 
-    auto_link::<SilentReporter, EpermHardLink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EPERM on the hardlink tier falls through to a tier that works");
+    auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EpermHardLink>::new(&src, &dst),
+    )
+    .expect("EPERM on the hardlink tier falls through to a tier that works");
 
     assert_eq!(fs::read(&dst).unwrap(), b"no hardlinks here");
     assert_ne!(inode(&src), inode(&dst), "the file was not hardlinked");
@@ -235,8 +245,12 @@ fn eperm_from_reflink_downgrades_the_clone_tier() {
     let dst = tmp.path().join("nested/dst.txt");
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
 
-    auto_link::<SilentReporter, EpermReflink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EPERM on the clone tier falls through to a tier that works");
+    auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EpermReflink>::new(&src, &dst),
+    )
+    .expect("EPERM on the clone tier falls through to a tier that works");
 
     assert_eq!(fs::read(&dst).unwrap(), b"no clones here");
     assert_ne!(state.load(Ordering::Relaxed), LINK_STATE_CLONE, "the clone tier is retired");
@@ -253,8 +267,12 @@ fn eperm_from_reflink_downgrades_clone_or_copy_to_copy() {
     let dst = tmp.path().join("nested/dst.txt");
     fs::create_dir_all(dst.parent().unwrap()).unwrap();
 
-    clone_or_copy_link::<SilentReporter, EpermReflink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EPERM on the clone tier falls through to copy");
+    clone_or_copy_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EpermReflink>::new(&src, &dst),
+    )
+    .expect("EPERM on the clone tier falls through to copy");
 
     assert_eq!(fs::read(&dst).unwrap(), b"copied instead");
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
@@ -267,8 +285,12 @@ fn eacces_from_hard_link_downgrades_the_auto_ladder() {
     let src = write_source(tmp.path(), "src.txt", b"no hardlinks here");
     let dst = tmp.path().join("dst.txt");
 
-    auto_link::<SilentReporter, EaccesHardLink>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("EACCES on the hardlink tier falls through");
+    auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EaccesHardLink>::new(&src, &dst),
+    )
+    .expect("EACCES on the hardlink tier falls through");
 
     assert_eq!(fs::read(&dst).unwrap(), b"no hardlinks here");
     assert_ne!(inode(&src), inode(&dst), "the file was not hardlinked");
@@ -292,8 +314,12 @@ fn eacces_from_both_link_tiers_copies_at_the_store_entry_mode() {
         let dst = tmp
             .path()
             .join(format!("target-{first_tier}"));
-        auto_link::<SilentReporter, EaccesLinks>(&logged, &state, &src, &dst)
-            .expect("copy works when link permissions are denied");
+        auto_link::<SilentReporter, _>(
+            &logged,
+            &state,
+            &PathImport::<EaccesLinks>::new(&src, &dst),
+        )
+        .expect("copy works when link permissions are denied");
 
         assert_eq!(fs::read(&dst).unwrap(), b"executable");
         assert_ne!(inode(&src), inode(&dst), "copy has its own inode");
@@ -318,8 +344,12 @@ fn eacces_from_reflink_downgrades_clone_or_copy() {
     let src = write_source(tmp.path(), "src.txt", b"copied");
     let dst = tmp.path().join("dst.txt");
 
-    clone_or_copy_link::<SilentReporter, EaccesLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("copy works when reflink permissions are denied");
+    clone_or_copy_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EaccesLinks>::new(&src, &dst),
+    )
+    .expect("copy works when reflink permissions are denied");
 
     assert_eq!(fs::read(&dst).unwrap(), b"copied");
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
@@ -332,8 +362,12 @@ fn explicit_link_methods_propagate_eacces() {
     let dst = tmp.path().join("dst.txt");
 
     for method in [PackageImportMethod::Hardlink, PackageImportMethod::Clone] {
-        let err = try_import::<SilentReporter, EaccesLinks>(method, &AtomicU8::new(0), &src, &dst)
-            .expect_err("explicit link methods must surface EACCES");
+        let err = try_import::<SilentReporter, _>(
+            method,
+            &AtomicU8::new(0),
+            &PathImport::<EaccesLinks>::new(&src, &dst),
+        )
+        .expect_err("explicit link methods must surface EACCES");
         assert_eq!(err.raw_os_error(), Some(libc::EACCES));
     }
 }
@@ -348,11 +382,10 @@ fn explicit_hardlink_propagates_eperm() {
     let src = write_source(tmp.path(), "src.txt", b"explicit");
     let dst = tmp.path().join("dst.txt");
 
-    let err = try_import::<SilentReporter, EpermHardLink>(
+    let err = try_import::<SilentReporter, _>(
         PackageImportMethod::Hardlink,
         &AtomicU8::new(0),
-        &src,
-        &dst,
+        &PathImport::<EpermHardLink>::new(&src, &dst),
     )
     .expect_err("EPERM on an explicit hardlink is not hidden behind a copy");
 
@@ -376,8 +409,12 @@ fn too_many_links_copies_one_file_and_keeps_the_hardlink_tier() {
     let src = write_source(tmp.path(), "src.txt", b"out of names");
     let dst = tmp.path().join("dst.txt");
 
-    auto_link::<SilentReporter, OutOfLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("a source out of names is copied, not failed");
+    auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<OutOfLinks>::new(&src, &dst),
+    )
+    .expect("a source out of names is copied, not failed");
 
     assert_eq!(fs::read(&dst).unwrap(), b"out of names");
     assert_eq!(
@@ -397,11 +434,10 @@ fn explicit_hardlink_copies_on_too_many_links() {
     let src = write_source(tmp.path(), "src.txt", b"explicit");
     let dst = tmp.path().join("dst.txt");
 
-    try_import::<SilentReporter, OutOfLinks>(
+    try_import::<SilentReporter, _>(
         PackageImportMethod::Hardlink,
         &AtomicU8::new(0),
-        &src,
-        &dst,
+        &PathImport::<OutOfLinks>::new(&src, &dst),
     )
     .expect("a source out of names is copied, not failed");
 

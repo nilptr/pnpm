@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use super::{
-    super::{Host, LINK_STATE_COPY, LINK_STATE_HARDLINK, auto_link, clone_or_copy_link},
+    super::{
+        Host, LINK_STATE_COPY, LINK_STATE_HARDLINK, PathImport, auto_link, clone_or_copy_link,
+    },
     write_source,
 };
 #[cfg(unix)]
@@ -29,7 +31,7 @@ fn auto_respects_cached_copy_state() {
     let src = write_source(tmp.path(), "src.txt", b"cached-copy");
     let dst = tmp.path().join("dst.txt");
 
-    auto_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
+    auto_link::<SilentReporter, _>(&AtomicU8::new(0), &state, &PathImport::<Host>::new(&src, &dst))
         .expect("copy should succeed");
 
     assert_eq!(fs::read(&dst).unwrap(), b"cached-copy");
@@ -52,7 +54,7 @@ fn auto_respects_cached_hardlink_state() {
     let src = write_source(tmp.path(), "src.txt", b"cached-hardlink");
     let dst = tmp.path().join("dst.txt");
 
-    auto_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
+    auto_link::<SilentReporter, _>(&AtomicU8::new(0), &state, &PathImport::<Host>::new(&src, &dst))
         .expect("hardlink should succeed on same-FS tempdir");
 
     assert_eq!(
@@ -76,8 +78,12 @@ fn clone_or_copy_respects_cached_copy_state() {
     let src = write_source(tmp.path(), "src.txt", b"cached");
     let dst = tmp.path().join("dst.txt");
 
-    clone_or_copy_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect("copy should succeed");
+    clone_or_copy_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<Host>::new(&src, &dst),
+    )
+    .expect("copy should succeed");
 
     assert_ne!(
         fs::metadata(&src).unwrap().ino(),

@@ -1,8 +1,8 @@
 use super::{
     super::{
-        AUTO_FIRST_TIER, Host, LINK_STATE_CLONE, LINK_STATE_HARDLINK, LinkFileError, auto_link,
-        clone_or_copy_link, downgrade_auto_tier, is_call_error, link_file, next_auto_tier,
-        recover_from_concurrent_import,
+        AUTO_FIRST_TIER, Host, LINK_STATE_CLONE, LINK_STATE_HARDLINK, LinkFileError, PathImport,
+        auto_link, clone_or_copy_link, downgrade_auto_tier, is_call_error, link_file,
+        next_auto_tier, recover_from_concurrent_import,
     },
     STORE_ENTRY, write_source,
 };
@@ -222,8 +222,9 @@ fn auto_keeps_the_hardlink_tier_across_a_mode_mismatch() {
     let dst = tmp.path().join("dst.txt");
     let logged = AtomicU8::new(0);
 
-    let method = auto_link::<SilentReporter, Host>(&logged, &state, &src, &dst)
-        .expect("copy fallback works");
+    let method =
+        auto_link::<SilentReporter, _>(&logged, &state, &PathImport::<Host>::new(&src, &dst))
+            .expect("copy fallback works");
     assert_eq!(method, WireImportMethod::Copy);
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_HARDLINK, "the tier survives a mode miss");
     assert_eq!(logged.load(Ordering::Relaxed), super::super::LOG_FLAG_COPY);
@@ -252,9 +253,12 @@ fn clone_tier_aligns_modes_to_the_current_umask() {
                 .join(format!("{name}.{stored:o}.dst"));
             let state = AtomicU8::new(LINK_STATE_CLONE);
 
-            let method =
-                auto_link::<SilentReporter, FreshClone>(&AtomicU8::new(0), &state, &src, &dst)
-                    .expect("reflink should succeed");
+            let method = auto_link::<SilentReporter, _>(
+                &AtomicU8::new(0),
+                &state,
+                &PathImport::<FreshClone>::new(&src, &dst),
+            )
+            .expect("reflink should succeed");
             assert_eq!(method, WireImportMethod::Clone);
 
             assert_ne!(super::inode(&src), super::inode(&dst), "reflink has its own inode");
@@ -574,8 +578,12 @@ fn auto_call_errors_propagate_without_downgrading() {
     let dst = tmp.path().join("dst");
     fs::write(&dst, b"pre-existing").unwrap();
 
-    let err = auto_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("target exists → AlreadyExists");
+    let err = auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<Host>::new(&src, &dst),
+    )
+    .expect_err("target exists → AlreadyExists");
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(
         state.load(Ordering::Relaxed),
@@ -640,8 +648,12 @@ fn clone_or_copy_call_errors_propagate_without_downgrading() {
     let dst = tmp.path().join("dst");
     fs::write(&dst, b"pre-existing").unwrap();
 
-    let err = clone_or_copy_link::<SilentReporter, Host>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("target exists → AlreadyExists");
+    let err = clone_or_copy_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<Host>::new(&src, &dst),
+    )
+    .expect_err("target exists → AlreadyExists");
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     assert_eq!(
         state.load(Ordering::Relaxed),
@@ -695,8 +707,12 @@ fn eacces_downgrade_still_surfaces_a_failed_copy() {
     let src = write_source(tmp.path(), "src.txt", b"unreachable target");
     let dst = tmp.path().join("missing-parent/dst.txt");
 
-    let err = auto_link::<SilentReporter, EaccesLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("copy cannot create a file under a missing directory");
+    let err = auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EaccesLinks>::new(&src, &dst),
+    )
+    .expect_err("copy cannot create a file under a missing directory");
 
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY);
@@ -713,8 +729,12 @@ fn eperm_downgrade_still_surfaces_a_failed_copy() {
     let src = write_source(tmp.path(), "src.txt", b"unreachable target");
     let dst = tmp.path().join("missing-parent/dst.txt");
 
-    let err = auto_link::<SilentReporter, EpermLinks>(&AtomicU8::new(0), &state, &src, &dst)
-        .expect_err("the copy tier cannot create a file under a missing directory");
+    let err = auto_link::<SilentReporter, _>(
+        &AtomicU8::new(0),
+        &state,
+        &PathImport::<EpermLinks>::new(&src, &dst),
+    )
+    .expect_err("the copy tier cannot create a file under a missing directory");
 
     assert_eq!(err.kind(), io::ErrorKind::NotFound);
     assert_eq!(state.load(Ordering::Relaxed), LINK_STATE_COPY, "both link tiers were retired");

@@ -278,3 +278,182 @@ fn final_link_target_points_into_the_final_directory() {
         PathBuf::from("/pkg/sub/dir"),
     );
 }
+
+/// A store under `root` holding `entries`, each written at `mode`, and the
+/// `cas_paths` that import them.
+#[cfg(unix)]
+fn store_with_entries(root: &Path, entries: &[(&str, &str, u32)]) -> HashMap<String, PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, (entry, suffix, mode))| {
+            let store_path = root.join(format!("store/files/0{index}/{:040x}{suffix}", index + 1));
+            fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+            fs::write(&store_path, entry.as_bytes()).unwrap();
+            fs::set_permissions(&store_path, fs::Permissions::from_mode(*mode)).unwrap();
+            (entry.to_string(), store_path)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn store_mode(executable: bool) -> u32 {
+    pnpm_fs::file_mode::store_entry_mode(executable, pnpm_fs::file_mode::current_umask())
+}
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_import_links_store_entries_into_nested_directories() {
+    let root = tempdir().unwrap();
+    let cas_paths = store_with_entries(
+        root.path(),
+        &[
+            ("package.json", "", store_mode(false)),
+            ("lib/esm/deep/index.js", "", store_mode(false)),
+            ("bin/cli", "-exec", store_mode(true)),
+        ],
+    );
+    let target = root.path().join("pkg");
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Hardlink,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    for (entry, store_path) in &cas_paths {
+        assert!(same_file::is_same_file(target.join(entry), store_path).unwrap(), "{entry}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_copy_carries_the_store_entry_mode() {
+    let root = tempdir().unwrap();
+    let cas_paths = store_with_entries(
+        root.path(),
+        &[("package.json", "", 0o600), ("lib/index.js", "", 0o600), ("bin/cli", "-exec", 0o700)],
+    );
+    let target = root.path().join("pkg");
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    for (entry, executable) in [("package.json", false), ("lib/index.js", false), ("bin/cli", true)]
+    {
+        assert_eq!(fs::read_to_string(target.join(entry)).unwrap(), entry);
+        assert_eq!(mode_of(&target.join(entry)), store_mode(executable), "{entry}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_hardlink_of_a_store_entry_with_a_wider_mode_is_replaced_by_a_copy() {
+    let root = tempdir().unwrap();
+    let cas_paths = store_with_entries(
+        root.path(),
+        &[("package.json", "", store_mode(false)), ("index.js", "", 0o666)],
+    );
+    let target = root.path().join("pkg");
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Hardlink,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    let imported = target.join("index.js");
+    assert!(!same_file::is_same_file(&imported, &cas_paths["index.js"]).unwrap());
+    assert_eq!(fs::read_to_string(&imported).unwrap(), "index.js");
+    assert_eq!(mode_of(&imported), store_mode(false));
+    assert_eq!(mode_of(&cas_paths["index.js"]), 0o666);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_import_adopts_a_file_a_concurrent_importer_placed() {
+    let root = tempdir().unwrap();
+    let cas_paths = store_with_entries(
+        root.path(),
+        &[("package.json", "", store_mode(false)), ("lib/index.js", "", store_mode(false))],
+    );
+    let target = root.path().join("pkg");
+    fs::create_dir_all(target.join("lib")).unwrap();
+    fs::hard_link(&cas_paths["lib/index.js"], target.join("lib/index.js")).unwrap();
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        same_file::is_same_file(target.join("lib/index.js"), &cas_paths["lib/index.js"]).unwrap()
+    );
+    assert_eq!(fs::read_to_string(target.join("package.json")).unwrap(), "package.json");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_import_reports_a_file_where_a_directory_belongs() {
+    let root = tempdir().unwrap();
+    let cas_paths = store_with_entries(
+        root.path(),
+        &[("package.json", "", store_mode(false)), ("lib/index.js", "", store_mode(false))],
+    );
+    let target = root.path().join("pkg");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("lib"), b"not a directory").unwrap();
+
+    let error = populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::Copy,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap_err();
+
+    dbg!(&error);
+    assert!(
+        error
+            .to_string()
+            .contains(
+                &target
+                    .join("lib/index.js")
+                    .display()
+                    .to_string()
+            )
+    );
+}

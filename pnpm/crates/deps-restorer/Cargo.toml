@@ -83,6 +83,7 @@ walkdir = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 pnpm-text-sanitize = { workspace = true }

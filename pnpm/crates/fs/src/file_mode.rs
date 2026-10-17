@@ -67,18 +67,18 @@ pub fn current_umask() -> u32 {
     *UMASK
 }
 
-/// `libc::umask` speaks `mode_t`, a `u16` on macOS and a `u32` on Linux.
+/// Widen a `mode_t`, which is a `u16` on macOS and a `u32` on Linux.
 /// `Into` is the one widening both platforms' clippy accepts: a cast is
 /// `cast_lossless` on macOS and `u32::from` is `useless_conversion` on
 /// Linux.
 #[cfg(unix)]
-fn widen_mode(mode: impl Into<u32>) -> u32 {
+pub fn widen_mode(mode: impl Into<u32>) -> u32 {
     mode.into()
 }
 
 /// The narrowing counterpart of [`widen_mode`], generic for the same reason.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn narrow_mode<Mode: TryFrom<u32>>(mode: u32) -> io::Result<Mode> {
+#[cfg(unix)]
+pub fn narrow_mode<Mode: TryFrom<u32>>(mode: u32) -> io::Result<Mode> {
     Mode::try_from(mode).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 

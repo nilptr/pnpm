@@ -9,10 +9,16 @@ use pnpm_reporter::{
 };
 use std::{
     fs, io,
+    marker::PhantomData,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
 };
-use target_mode::{align_target_mode, desired_permissions, source_has_desired_mode};
+use target_mode::{
+    align_target_mode, desired_permissions, mode_is_linkable, source_has_desired_mode,
+};
+
+#[cfg(unix)]
+pub(crate) use at::{AtImport, AtPath, StoreFilesDir};
 
 /// Error type for [`link_file`].
 #[derive(Debug, Display, Error, Diagnostic)]
@@ -225,9 +231,27 @@ pub fn import_into_fresh_target<Reporter: self::Reporter>(
     // Current pnpm's indexed-pkg-importer does not guard against this
     // either — postinstall handling lives in the script runner, not the
     // import layer — so there's nothing to gate on here.
-    try_import::<Reporter, Host>(method, logged, source_file, target_link)
+    import_fresh::<Reporter, _>(
+        logged,
+        method,
+        &PathImport::<Host>::new(source_file, target_link),
+        source_file,
+        || target_link.to_path_buf(),
+    )
+}
+
+/// [`import_into_fresh_target`] through any [`FileImport`]. `target_link`
+/// names the target as a path, and is called only when an import fails.
+pub(crate) fn import_fresh<Reporter: self::Reporter, Import: FileImport>(
+    logged: &AtomicU8,
+    method: PackageImportMethod,
+    import: &Import,
+    source_file: &Path,
+    target_link: impl FnOnce() -> PathBuf,
+) -> Result<(), LinkFileError> {
+    try_import::<Reporter, _>(method, logged, import)
         .map(|_| ())
-        .or_else(|error| recover_from_concurrent_import(error, source_file, target_link))
+        .or_else(|error| recover_from_concurrent_import(error, source_file, &target_link()))
 }
 
 /// Resolve an import syscall failure against a target the caller
@@ -342,29 +366,32 @@ impl ImportState {
         source_file: &Path,
         target_link: &Path,
     ) -> io::Result<WireImportMethod> {
+        self.import_file::<Reporter, _>(
+            method,
+            logged,
+            &PathImport::<Sys>::new(source_file, target_link),
+        )
+    }
+
+    /// [`Self::import`] through any [`FileImport`].
+    pub(crate) fn import_file<Reporter: self::Reporter, Import: FileImport>(
+        &self,
+        method: PackageImportMethod,
+        logged: &AtomicU8,
+        import: &Import,
+    ) -> io::Result<WireImportMethod> {
         match method {
-            PackageImportMethod::Auto => {
-                auto_link::<Reporter, Sys>(logged, &self.auto, source_file, target_link)
-            }
-            PackageImportMethod::Hardlink => {
-                hardlink_file::<Reporter, Sys>(logged, source_file, target_link)
-            }
-            PackageImportMethod::Clone => clone_file::<Sys>(source_file, target_link)
+            PackageImportMethod::Auto => auto_link::<Reporter, _>(logged, &self.auto, import),
+            PackageImportMethod::Hardlink => hardlink_file::<Reporter, _>(logged, import),
+            PackageImportMethod::Clone => clone_file(import)
                 .inspect(|()| {
                     log_method_once::<Reporter>(logged, WireImportMethod::Clone);
                 })
                 .map(|()| WireImportMethod::Clone),
-            PackageImportMethod::CloneOrCopy => clone_or_copy_link::<Reporter, Sys>(
-                logged,
-                &self.clone_or_copy,
-                source_file,
-                target_link,
-            ),
-            PackageImportMethod::Copy => copy_file(source_file, target_link)
-                .inspect(|()| {
-                    log_method_once::<Reporter>(logged, WireImportMethod::Copy);
-                })
-                .map(|()| WireImportMethod::Copy),
+            PackageImportMethod::CloneOrCopy => {
+                clone_or_copy_link::<Reporter, _>(logged, &self.clone_or_copy, import)
+            }
+            PackageImportMethod::Copy => copy_and_log::<Reporter>(logged, import),
         }
     }
 }
@@ -375,10 +402,9 @@ impl Default for ImportState {
     }
 }
 
-fn hardlink_file<Reporter: self::Reporter, Sys: FsHardLink>(
+fn hardlink_file<Reporter: self::Reporter, Import: FileImport>(
     logged: &AtomicU8,
-    source_file: &Path,
-    target_link: &Path,
+    import: &Import,
 ) -> io::Result<WireImportMethod> {
     // pnpm's explicit `hardlink` method uses `hardlinkPkg(linkOrCopy)`,
     // which copies on any link failure other than `EEXIST`. Only
@@ -394,41 +420,39 @@ fn hardlink_file<Reporter: self::Reporter, Sys: FsHardLink>(
     // syscall itself is already cheap; pnpm doesn't cache this path
     // either.
     //
-    // A mode that does not match the current umask cannot be fixed on the
-    // store inode every name shares, so the file is copied at the
-    // [`desired_mode`] instead (pnpm/pnpm#3807).
-    if source_has_desired_mode(source_file)? {
-        match Sys::hard_link(source_file, target_link) {
-            Ok(()) => {
-                log_method_once::<Reporter>(logged, WireImportMethod::Hardlink);
-                Ok(WireImportMethod::Hardlink)
-            }
-            Err(error) if is_cross_device(&error) || is_too_many_links(&error) => {
-                copy_file(source_file, target_link)
-                    .inspect(|()| {
-                        log_method_once::<Reporter>(logged, WireImportMethod::Copy);
-                    })
-                    .map(|()| WireImportMethod::Copy)
-            }
-            Err(error) => Err(error),
+    match import.hard_link() {
+        Ok(()) => keep_link_or_copy::<Reporter>(logged, import),
+        Err(error) if is_cross_device(&error) || is_too_many_links(&error) => {
+            copy_and_log::<Reporter>(logged, import)
         }
-    } else {
-        copy_file(source_file, target_link)
-            .inspect(|()| {
-                log_method_once::<Reporter>(logged, WireImportMethod::Copy);
-            })
-            .map(|()| WireImportMethod::Copy)
+        Err(error) => Err(error),
     }
 }
 
-fn try_import<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
+/// Settle a hard link that was just placed. A store inode whose mode does
+/// not match the current umask cannot be fixed, since every name shares it,
+/// so the link is replaced by a copy at the desired mode (pnpm/pnpm#3807).
+fn keep_link_or_copy<Reporter: self::Reporter>(
+    logged: &AtomicU8,
+    import: &impl FileImport,
+) -> io::Result<WireImportMethod> {
+    // Reading the mode from the new link puts no stat ahead of the link,
+    // and resolves only the target's path below its directory.
+    if import.linked_mode_is_linkable()? {
+        log_method_once::<Reporter>(logged, WireImportMethod::Hardlink);
+        return Ok(WireImportMethod::Hardlink);
+    }
+    import.remove_target()?;
+    copy_and_log::<Reporter>(logged, import)
+}
+
+fn try_import<Reporter: self::Reporter, Import: FileImport>(
     method: PackageImportMethod,
     logged: &AtomicU8,
-    source_file: &Path,
-    target_link: &Path,
+    import: &Import,
 ) -> io::Result<WireImportMethod> {
     static STATE: ImportState = ImportState::new();
-    STATE.import::<Reporter, Sys>(method, logged, source_file, target_link)
+    STATE.import_file::<Reporter, _>(method, logged, import)
 }
 
 /// Materialize `source_file` at `target_link` for the copy tier.
@@ -447,11 +471,11 @@ fn copy_file(source_file: &Path, target_link: &Path) -> io::Result<()> {
     )
 }
 
-/// [`FsReflink::reflink`] for the explicit `Clone` method, then
+/// [`FileImport::reflink`] for the explicit `Clone` method, then
 /// alignment with the store-entry mode.
-fn clone_file<Sys: FsReflink>(source_file: &Path, target_link: &Path) -> io::Result<()> {
-    Sys::reflink(source_file, target_link)?;
-    align_target_mode(source_file, target_link)
+fn clone_file(import: &impl FileImport) -> io::Result<()> {
+    import.reflink()?;
+    import.align_target_mode()
 }
 
 #[cfg(unix)]
@@ -514,10 +538,9 @@ fn is_call_error(err: &io::Error) -> bool {
 
 fn copy_and_log<Reporter: self::Reporter>(
     logged: &AtomicU8,
-    source: &Path,
-    target: &Path,
+    import: &impl FileImport,
 ) -> io::Result<WireImportMethod> {
-    copy_file(source, target)?;
+    import.copy()?;
     log_method_once::<Reporter>(logged, WireImportMethod::Copy);
     Ok(WireImportMethod::Copy)
 }
@@ -532,27 +555,26 @@ fn copy_and_log<Reporter: self::Reporter>(
 /// downgrade the cached state; other errors propagate immediately so a
 /// one-off `NotFound` on a single file doesn't permanently disable a
 /// tier for the rest of the process.
-fn auto_link<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
+fn auto_link<Reporter: self::Reporter, Import: FileImport>(
     logged: &AtomicU8,
     state: &AtomicU8,
-    source: &Path,
-    target: &Path,
+    import: &Import,
 ) -> io::Result<WireImportMethod> {
     loop {
         match state.load(Ordering::Relaxed) {
             LINK_STATE_CLONE => {
-                if clone_tier::<Reporter, Sys>(logged, source, target)? {
+                if clone_tier::<Reporter>(logged, import)? {
                     return Ok(WireImportMethod::Clone);
                 }
                 downgrade_auto_tier(state, LINK_STATE_CLONE);
             }
             LINK_STATE_HARDLINK => {
-                if let Some(method) = hardlink_tier::<Reporter, Sys>(logged, source, target)? {
+                if let Some(method) = hardlink_tier::<Reporter>(logged, import)? {
                     return Ok(method);
                 }
                 downgrade_auto_tier(state, LINK_STATE_HARDLINK);
             }
-            _ => return copy_and_log::<Reporter>(logged, source, target),
+            _ => return copy_and_log::<Reporter>(logged, import),
         }
     }
 }
@@ -565,14 +587,13 @@ fn auto_link<Reporter: self::Reporter, Sys: FsHardLink + FsReflink>(
 /// reflink created the target, so its error is terminal — downgrading
 /// on it would re-attempt the next tier against that just-created file
 /// and mask the real error behind `AlreadyExists`.
-fn clone_tier<Reporter: self::Reporter, Sys: FsReflink>(
+fn clone_tier<Reporter: self::Reporter>(
     logged: &AtomicU8,
-    source: &Path,
-    target: &Path,
+    import: &impl FileImport,
 ) -> io::Result<bool> {
-    match Sys::reflink(source, target) {
+    match import.reflink() {
         Ok(()) => {
-            align_target_mode(source, target)?;
+            import.align_target_mode()?;
             log_method_once::<Reporter>(logged, WireImportMethod::Clone);
             Ok(true)
         }
@@ -586,28 +607,18 @@ fn clone_tier<Reporter: self::Reporter, Sys: FsReflink>(
 /// for: a source out of names copies here and reports the tier still
 /// usable, because [`is_too_many_links`] says nothing about the next
 /// file.
-/// A source whose on-disk mode does not match the current umask's
-/// store-entry mode copies at the right mode, keeping the tier for the
-/// files whose mode does match (pnpm/pnpm#3807).
-fn hardlink_tier<Reporter: self::Reporter, Sys: FsHardLink>(
+/// A source whose mode does not match the current umask's store-entry
+/// mode is copied at the right mode (see [`keep_link_or_copy`]), keeping
+/// the tier for the files whose mode does match.
+fn hardlink_tier<Reporter: self::Reporter>(
     logged: &AtomicU8,
-    source: &Path,
-    target: &Path,
+    import: &impl FileImport,
 ) -> io::Result<Option<WireImportMethod>> {
-    if source_has_desired_mode(source)? {
-        match Sys::hard_link(source, target) {
-            Ok(()) => {
-                log_method_once::<Reporter>(logged, WireImportMethod::Hardlink);
-                Ok(Some(WireImportMethod::Hardlink))
-            }
-            Err(err) if is_too_many_links(&err) => {
-                copy_and_log::<Reporter>(logged, source, target).map(Some)
-            }
-            Err(err) if is_call_error(&err) => Err(err),
-            Err(_) => Ok(None),
-        }
-    } else {
-        copy_and_log::<Reporter>(logged, source, target).map(Some)
+    match import.hard_link() {
+        Ok(()) => keep_link_or_copy::<Reporter>(logged, import).map(Some),
+        Err(err) if is_too_many_links(&err) => copy_and_log::<Reporter>(logged, import).map(Some),
+        Err(err) if is_call_error(&err) => Err(err),
+        Err(_) => Ok(None),
     }
 }
 
@@ -617,24 +628,86 @@ fn hardlink_tier<Reporter: self::Reporter, Sys: FsHardLink>(
 /// first reflink failure reassigns its closure directly to `copyPkg`.
 /// Same error-narrowing as [`auto_link`]: only capability failures
 /// downgrade; real errors propagate.
-fn clone_or_copy_link<Reporter: self::Reporter, Sys: FsReflink>(
+fn clone_or_copy_link<Reporter: self::Reporter, Import: FileImport>(
     logged: &AtomicU8,
     state: &AtomicU8,
-    source: &Path,
-    target: &Path,
+    import: &Import,
 ) -> io::Result<WireImportMethod> {
     loop {
         match state.load(Ordering::Relaxed) {
             LINK_STATE_CLONE => {
-                if clone_tier::<Reporter, Sys>(logged, source, target)? {
+                if clone_tier::<Reporter>(logged, import)? {
                     return Ok(WireImportMethod::Clone);
                 }
                 state.fetch_max(LINK_STATE_COPY, Ordering::Relaxed);
             }
-            _ => return copy_and_log::<Reporter>(logged, source, target),
+            _ => return copy_and_log::<Reporter>(logged, import),
         }
     }
 }
+
+/// The filesystem calls that put one source file at one target that does
+/// not exist yet. The import tiers decide which calls run and in what
+/// order.
+pub(crate) trait FileImport {
+    /// Hard link the source at the target.
+    fn hard_link(&self) -> io::Result<()>;
+    /// Clone the source copy-on-write. The clone may carry the source's
+    /// mode until [`Self::align_target_mode`] runs.
+    fn reflink(&self) -> io::Result<()>;
+    /// Copy the source to a target created exclusively with the source's
+    /// [`desired_permissions`], removing a partial copy on failure.
+    fn copy(&self) -> io::Result<()>;
+    /// Give a reflinked target the mode a fresh store write would give it.
+    fn align_target_mode(&self) -> io::Result<()>;
+    /// Whether the inode a hard link just placed has a mode that may stay
+    /// linked (see [`pnpm_fs::file_mode::store_inode_mode_is_linkable`]).
+    fn linked_mode_is_linkable(&self) -> io::Result<bool>;
+    /// Unlink the target.
+    fn remove_target(&self) -> io::Result<()>;
+}
+
+/// [`FileImport`] between two paths, linking through `Sys`.
+pub(crate) struct PathImport<'a, Sys> {
+    source: &'a Path,
+    target: &'a Path,
+    sys: PhantomData<Sys>,
+}
+
+impl<'a, Sys> PathImport<'a, Sys> {
+    pub(crate) fn new(source: &'a Path, target: &'a Path) -> Self {
+        PathImport { source, target, sys: PhantomData }
+    }
+}
+
+impl<Sys: FsHardLink + FsReflink> FileImport for PathImport<'_, Sys> {
+    fn hard_link(&self) -> io::Result<()> {
+        Sys::hard_link(self.source, self.target)
+    }
+
+    fn reflink(&self) -> io::Result<()> {
+        Sys::reflink(self.source, self.target)
+    }
+
+    fn copy(&self) -> io::Result<()> {
+        copy_file(self.source, self.target)
+    }
+
+    fn align_target_mode(&self) -> io::Result<()> {
+        align_target_mode(self.source, self.target)
+    }
+
+    fn linked_mode_is_linkable(&self) -> io::Result<bool> {
+        mode_is_linkable(self.source, || target_mode::file_mode(self.target))
+    }
+
+    fn remove_target(&self) -> io::Result<()> {
+        fs::remove_file(self.target)
+    }
+}
+
+#[cfg(unix)]
+mod at;
 
 mod target_mode;
 

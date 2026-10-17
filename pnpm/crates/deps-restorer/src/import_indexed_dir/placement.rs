@@ -58,6 +58,15 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
     placement: Placement,
     symlinks_final_dir: Option<&Path>,
 ) -> Result<(), ImportIndexedDirError> {
+    #[cfg(unix)]
+    if placement == Placement::Fresh && symlinks_final_dir.is_none() {
+        return populate_fresh_dir_at::<Reporter>(
+            logged_methods,
+            import_method,
+            dir_path,
+            cas_paths,
+        );
+    }
     create_indexed_dirs(dir_path, cas_paths, placement)?;
     let imported = symlinks_final_dir.map(|_| imported_paths(cas_paths));
     let symlinks = symlinks_final_dir
@@ -99,6 +108,107 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
     }
     Ok(())
 }
+/// [`Placement::Fresh`] without symlinks, the common import, through the
+/// `*at` calls: `dir_path` and the store's `files` directory are opened
+/// once, and every directory and file below them resolves only its path
+/// relative to them.
+#[cfg(unix)]
+fn populate_fresh_dir_at<Reporter: self::Reporter>(
+    logged_methods: &AtomicU8,
+    import_method: PackageImportMethod,
+    dir_path: &Path,
+    cas_paths: &HashMap<String, PathBuf>,
+) -> Result<(), ImportIndexedDirError> {
+    use crate::{AtImport, AtPath, StoreFilesDir, link_file::import_fresh};
+    use std::os::fd::AsFd;
+
+    let root = create_indexed_dirs_at(dir_path, cas_paths)?;
+    let store_files = StoreFilesDir::open(cas_paths.values().map(PathBuf::as_path));
+    let marker = marker_file(cas_paths);
+    entries_by_target_dir(cas_paths, marker)
+        .par_iter()
+        .try_for_each(|entries| {
+            entries
+                .iter()
+                .try_for_each(|(cleaned_entry, store_path)| {
+                    #[cfg(test)]
+                    let _writer = tests::DirectoryWriters::enter(dir_path, cleaned_entry);
+                    let import = AtImport::new(
+                        store_path,
+                        StoreFilesDir::locate(store_files.as_ref(), store_path),
+                        AtPath::new(root.as_fd(), Path::new(cleaned_entry)),
+                    );
+                    import_fresh::<Reporter, _>(
+                        logged_methods,
+                        import_method,
+                        &import,
+                        store_path,
+                        || dir_path.join(cleaned_entry),
+                    )
+                    .map_err(ImportIndexedDirError::LinkFile)
+                })
+        })?;
+
+    if let Some(marker) = marker {
+        place_marker::<Reporter>(
+            Placement::Fresh,
+            logged_methods,
+            import_method,
+            &cas_paths[marker],
+            &dir_path.join(marker),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Create `dir_path` and every directory `cas_paths` places a file in,
+/// returning `dir_path` opened. Each directory below `dir_path` is one
+/// `mkdirat` relative to it, parents first.
+#[cfg(unix)]
+fn create_indexed_dirs_at(
+    dir_path: &Path,
+    cas_paths: &HashMap<String, PathBuf>,
+) -> Result<std::os::fd::OwnedFd, ImportIndexedDirError> {
+    use crate::AtPath;
+    use std::os::fd::AsFd;
+
+    pnpm_fs::create_dir_all_with_retry(dir_path)
+        .map_err(|error| ImportIndexedDirError::CreateDir {
+            dirname: dir_path.to_path_buf(),
+            error,
+        })?;
+    let root = AtPath::cwd(dir_path)
+        .open_dir()
+        .map_err(|error| ImportIndexedDirError::CreateDir {
+            dirname: dir_path.to_path_buf(),
+            error,
+        })?;
+
+    let mut rel_dirs: HashSet<&Path> = HashSet::new();
+    for entry in cas_paths.keys() {
+        for ancestor in Path::new(entry).ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() || !rel_dirs.insert(ancestor) {
+                break;
+            }
+        }
+    }
+    let mut ordered: Vec<&Path> = rel_dirs.into_iter().collect();
+    ordered.sort_by_key(|rel| rel.as_os_str().len());
+    for rel in ordered {
+        match AtPath::new(root.as_fd(), rel).create_dir() {
+            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+                return Err(ImportIndexedDirError::CreateDir {
+                    dirname: dir_path.join(rel),
+                    error,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(root)
+}
+
 /// The entries of `cas_paths` other than `marker`, grouped by the
 /// directory they land in.
 ///
