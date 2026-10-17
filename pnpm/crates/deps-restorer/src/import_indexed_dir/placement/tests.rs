@@ -425,7 +425,7 @@ fn a_fresh_import_adopts_a_file_a_concurrent_importer_placed() {
 
 #[cfg(unix)]
 #[test]
-fn a_fresh_import_reports_a_file_where_a_directory_belongs() {
+fn a_fresh_import_reports_the_file_where_a_directory_belongs() {
     let root = tempdir().unwrap();
     let cas_paths = store_with_entries(
         root.path(),
@@ -446,14 +446,39 @@ fn a_fresh_import_reports_a_file_where_a_directory_belongs() {
     .unwrap_err();
 
     dbg!(&error);
-    assert!(
-        error
-            .to_string()
-            .contains(
-                &target
-                    .join("lib/index.js")
-                    .display()
-                    .to_string()
-            )
+    assert!(matches!(
+        error,
+        super::ImportIndexedDirError::CreateDir { ref dirname, .. } if *dirname == target.join("lib"),
+    ));
+}
+
+/// Covers both clone tiers: `clonefile` copies the source's wider mode,
+/// which is then aligned, and a Linux filesystem without `FICLONE` must
+/// remove the empty target it created before the copy tier writes there.
+#[cfg(unix)]
+#[test]
+fn a_fresh_clone_or_copy_carries_the_store_entry_mode() {
+    let root = tempdir().unwrap();
+    let cas_paths = store_with_entries(
+        root.path(),
+        &[("package.json", "", 0o666), ("lib/index.js", "", 0o666), ("bin/cli", "-exec", 0o777)],
     );
+    let target = root.path().join("pkg");
+
+    populate_dir::<SilentReporter>(
+        &AtomicU8::new(0),
+        PackageImportMethod::CloneOrCopy,
+        &target,
+        &cas_paths,
+        Placement::Fresh,
+        None,
+    )
+    .unwrap();
+
+    for (entry, executable) in [("package.json", false), ("lib/index.js", false), ("bin/cli", true)]
+    {
+        assert_eq!(fs::read_to_string(target.join(entry)).unwrap(), entry);
+        assert_eq!(mode_of(&target.join(entry)), store_mode(executable), "{entry}");
+    }
+    assert_eq!(mode_of(&cas_paths["lib/index.js"]), 0o666);
 }

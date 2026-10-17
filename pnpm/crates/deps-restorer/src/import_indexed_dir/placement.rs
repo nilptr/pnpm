@@ -196,15 +196,12 @@ fn create_indexed_dirs_at(
     let mut ordered: Vec<&Path> = rel_dirs.into_iter().collect();
     ordered.sort_by_key(|rel| rel.as_os_str().len());
     for rel in ordered {
-        match AtPath::new(root.as_fd(), rel).create_dir() {
-            Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
-                return Err(ImportIndexedDirError::CreateDir {
-                    dirname: dir_path.join(rel),
-                    error,
-                });
-            }
-            _ => {}
-        }
+        AtPath::new(root.as_fd(), rel)
+            .create_dir()
+            .map_err(|error| ImportIndexedDirError::CreateDir {
+                dirname: dir_path.join(rel),
+                error,
+            })?;
     }
     Ok(root)
 }

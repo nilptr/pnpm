@@ -56,8 +56,18 @@ impl<'a> AtPath<'a> {
         self.open(OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
     }
 
+    /// Create a directory whose parent exists. A directory already there,
+    /// or a symlink to one, counts as created, as in [`fs::create_dir_all`].
     pub(crate) fn create_dir(self) -> io::Result<()> {
-        Ok(rustix::fs::mkdirat(self.dir, self.path, Mode::from_raw_mode(0o777))?)
+        match rustix::fs::mkdirat(self.dir, self.path, Mode::from_raw_mode(0o777)) {
+            Err(rustix::io::Errno::EXIST) if self.is_dir() => Ok(()),
+            result => Ok(result?),
+        }
+    }
+
+    fn is_dir(self) -> bool {
+        rustix::fs::statat(self.dir, self.path, AtFlags::empty())
+            .is_ok_and(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir())
     }
 
     fn remove_file(self) -> io::Result<()> {
