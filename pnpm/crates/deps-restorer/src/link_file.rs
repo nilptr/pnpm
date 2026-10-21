@@ -18,7 +18,7 @@ use target_mode::{
 };
 
 #[cfg(unix)]
-pub(crate) use at::{AtImport, AtPath, StoreFilesDir};
+pub(crate) use at::{AtImport, StoreFilesDir};
 
 /// Error type for [`link_file`].
 #[derive(Debug, Display, Error, Diagnostic)]

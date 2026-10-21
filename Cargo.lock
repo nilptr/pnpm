@@ -5245,6 +5245,7 @@ dependencies = [
  "pnpm-crypto-hash",
  "pnpm-wasm-host",
  "reflink-copy",
+ "rustix 1.1.4",
  "same-file",
  "sha2",
  "tempfile",

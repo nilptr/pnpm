@@ -79,8 +79,9 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
     let marker = marker_file(cas_paths);
     entries_by_target_dir(cas_paths, marker)
         .par_iter()
-        .try_for_each(|entries| {
-            entries
+        .with_max_len(1)
+        .try_for_each(|group| {
+            group.entries
                 .iter()
                 .try_for_each(|(cleaned_entry, store_path)| {
                     #[cfg(test)]
@@ -109,9 +110,9 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
     Ok(())
 }
 /// [`Placement::Fresh`] without symlinks, the common import, through the
-/// `*at` calls: `dir_path` and the store's `files` directory are opened
-/// once, and every directory and file below them resolves only its path
-/// relative to them.
+/// `*at` calls: `dir_path`, each directory below it, and the store's
+/// `files` directory are opened once, and every directory and file below
+/// them resolves only its path relative to them.
 #[cfg(unix)]
 fn populate_fresh_dir_at<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
@@ -119,35 +120,23 @@ fn populate_fresh_dir_at<Reporter: self::Reporter>(
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
 ) -> Result<(), ImportIndexedDirError> {
-    use crate::{AtImport, AtPath, StoreFilesDir, link_file::import_fresh};
+    use crate::StoreFilesDir;
     use std::os::fd::AsFd;
 
     let root = create_indexed_dirs_at(dir_path, cas_paths)?;
     let store_files = StoreFilesDir::open(cas_paths.values().map(PathBuf::as_path));
     let marker = marker_file(cas_paths);
+    let placing = FreshAtPlacing {
+        logged_methods,
+        import_method,
+        dir_path,
+        root: root.as_fd(),
+        store_files: store_files.as_ref(),
+    };
     entries_by_target_dir(cas_paths, marker)
         .par_iter()
-        .try_for_each(|entries| {
-            entries
-                .iter()
-                .try_for_each(|(cleaned_entry, store_path)| {
-                    #[cfg(test)]
-                    let _writer = tests::DirectoryWriters::enter(dir_path, cleaned_entry);
-                    let import = AtImport::new(
-                        store_path,
-                        StoreFilesDir::locate(store_files.as_ref(), store_path),
-                        AtPath::new(root.as_fd(), Path::new(cleaned_entry)),
-                    );
-                    import_fresh::<Reporter, _>(
-                        logged_methods,
-                        import_method,
-                        &import,
-                        store_path,
-                        || dir_path.join(cleaned_entry),
-                    )
-                    .map_err(ImportIndexedDirError::LinkFile)
-                })
-        })?;
+        .with_max_len(1)
+        .try_for_each(|group| placing.place::<Reporter>(group))?;
 
     if let Some(marker) = marker {
         place_marker::<Reporter>(
@@ -162,6 +151,71 @@ fn populate_fresh_dir_at<Reporter: self::Reporter>(
     Ok(())
 }
 
+/// How [`populate_fresh_dir_at`] places the entries of one import.
+#[cfg(unix)]
+struct FreshAtPlacing<'a> {
+    logged_methods: &'a AtomicU8,
+    import_method: PackageImportMethod,
+    dir_path: &'a Path,
+    /// `dir_path`, open.
+    root: std::os::fd::BorrowedFd<'a>,
+    store_files: Option<&'a crate::StoreFilesDir>,
+}
+
+#[cfg(unix)]
+impl FreshAtPlacing<'_> {
+    /// Place `group` through its directory, opened once, so each entry
+    /// resolves only its name.
+    fn place<Reporter: self::Reporter>(
+        &self,
+        group: &TargetDirEntries<'_>,
+    ) -> Result<(), ImportIndexedDirError> {
+        use crate::{AtImport, StoreFilesDir, link_file::import_fresh};
+        use pnpm_fs::AtPath;
+        use std::os::fd::AsFd;
+
+        let target_dir = group.target_dir.filter(|dir| !dir.as_os_str().is_empty());
+        let opened = target_dir
+            .map(|dir| self.open_dir(dir))
+            .transpose()?;
+        let dir = opened.as_ref().map_or(self.root, AsFd::as_fd);
+        group.entries
+            .iter()
+            .try_for_each(|(cleaned_entry, store_path)| {
+                #[cfg(test)]
+                let _writer = tests::DirectoryWriters::enter(self.dir_path, cleaned_entry);
+                let entry = Path::new(cleaned_entry);
+                let name = target_dir
+                    .and_then(|dir| entry.strip_prefix(dir).ok())
+                    .unwrap_or(entry);
+                let import = AtImport::new(
+                    store_path,
+                    StoreFilesDir::locate(self.store_files, store_path),
+                    AtPath::new(dir, name),
+                );
+                import_fresh::<Reporter, _>(
+                    self.logged_methods,
+                    self.import_method,
+                    &import,
+                    store_path,
+                    || self.dir_path.join(cleaned_entry),
+                )
+                .map_err(ImportIndexedDirError::LinkFile)
+            })
+    }
+
+    /// Open the directory at `relative`, which [`create_indexed_dirs_at`]
+    /// created.
+    fn open_dir(&self, relative: &Path) -> Result<std::os::fd::OwnedFd, ImportIndexedDirError> {
+        pnpm_fs::AtPath::new(self.root, relative)
+            .open_dir()
+            .map_err(|error| ImportIndexedDirError::CreateDir {
+                dirname: self.dir_path.join(relative),
+                error,
+            })
+    }
+}
+
 /// Create `dir_path` and every directory `cas_paths` places a file in,
 /// returning `dir_path` opened. Each directory below `dir_path` is one
 /// `mkdirat` relative to it, parents first.
@@ -170,7 +224,7 @@ fn create_indexed_dirs_at(
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
 ) -> Result<std::os::fd::OwnedFd, ImportIndexedDirError> {
-    use crate::AtPath;
+    use pnpm_fs::AtPath;
     use std::os::fd::AsFd;
 
     pnpm_fs::create_dir_all_with_retry(dir_path)
@@ -218,10 +272,15 @@ fn create_indexed_dirs_at(
 /// per directory 3 s, pnpm v11's serial per-package loop 2 s.
 /// Directories are independent, so a package spread over many of them
 /// still imports in parallel.
+///
+/// The groups come largest first. rayon splits the slice in index order
+/// and each group is its own task, so the directories with the most
+/// files start first and the small ones fill in behind them, instead of
+/// a large directory starting last and finishing alone.
 fn entries_by_target_dir<'a>(
     cas_paths: &'a HashMap<String, PathBuf>,
     marker: Option<&str>,
-) -> Vec<Vec<(&'a str, &'a Path)>> {
+) -> Vec<TargetDirEntries<'a>> {
     let mut groups: HashMap<Option<&Path>, Vec<(&str, &Path)>> = HashMap::new();
     for (cleaned_entry, store_path) in cas_paths {
         if Some(cleaned_entry.as_str()) == marker {
@@ -232,7 +291,19 @@ fn entries_by_target_dir<'a>(
             .or_default()
             .push((cleaned_entry, store_path));
     }
-    groups.into_values().collect()
+    let mut groups: Vec<TargetDirEntries<'a>> = groups
+        .into_iter()
+        .map(|(target_dir, entries)| TargetDirEntries { target_dir, entries })
+        .collect();
+    groups.sort_by_key(|group| std::cmp::Reverse(group.entries.len()));
+    groups
+}
+
+/// The entries that land in one directory.
+struct TargetDirEntries<'a> {
+    /// Relative to the package, empty at its root.
+    target_dir: Option<&'a Path>,
+    entries: Vec<(&'a str, &'a Path)>,
 }
 pub(super) fn create_indexed_dirs(
     dir_path: &Path,

@@ -95,6 +95,21 @@ fn a_directory_has_one_writer_at_a_time() {
 }
 
 #[test]
+fn directories_with_more_entries_come_first() {
+    let cas_paths: HashMap<String, PathBuf> = ["a/1", "b/1", "b/2", "b/3", "c/1", "c/2", "d"]
+        .into_iter()
+        .map(|entry| (entry.to_string(), PathBuf::from("store").join(entry)))
+        .collect();
+
+    let sizes: Vec<usize> = entries_by_target_dir(&cas_paths, None)
+        .iter()
+        .map(|group| group.entries.len())
+        .collect();
+
+    assert_eq!(sizes, [3, 2, 1, 1]);
+}
+
+#[test]
 fn entries_are_grouped_by_the_directory_they_land_in() {
     let cas_paths: HashMap<String, PathBuf> =
         ["package.json", "README.md", "lib/index.js", "lib/util.js", "lib/esm/index.js"]
@@ -104,10 +119,11 @@ fn entries_are_grouped_by_the_directory_they_land_in() {
 
     let groups: BTreeSet<BTreeSet<&str>> = entries_by_target_dir(&cas_paths, Some("package.json"))
         .iter()
-        .map(|entries| {
-            entries
+        .map(|group| {
+            group.entries
                 .iter()
                 .map(|(entry, store_path)| {
+                    assert_eq!(group.target_dir, Path::new(entry).parent());
                     assert_eq!(*store_path, cas_paths[*entry]);
                     *entry
                 })

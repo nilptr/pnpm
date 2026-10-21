@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub use at_path::AtPath;
 pub mod file_mode;
 #[cfg(all(windows, feature = "test"))]
 pub mod test_support;
@@ -6,7 +8,7 @@ pub use capabilities::*;
 pub use copy_dirent::{copy_dir_contents, copy_dirent, create_symlink};
 pub use copy_file_exclusive::{
     CopyPermissions, copy_file_atomic, copy_file_atomic_with_permissions, copy_file_exclusive,
-    copy_permissions, read_file_permissions, set_file_permissions,
+    copy_into_created, copy_permissions, read_file_permissions, set_file_permissions,
 };
 pub use cross_device::is_cross_device;
 pub use dir_lock::DirLock;
@@ -46,6 +48,8 @@ pub use wasi_fs::{
 };
 pub use write_atomic::{write_atomic, write_atomic_private};
 
+#[cfg(unix)]
+mod at_path;
 mod background_drop;
 mod capabilities;
 mod copy_dirent;

@@ -72,14 +72,26 @@ pub fn copy_file_exclusive(
 ) -> io::Result<()> {
     let mut source = fs::File::open(source_path)?;
     let mut target = create_new_with_permissions(target_path, permissions)?;
-    io::copy(&mut source, &mut target)
-        .and_then(|_| set_file_permissions(&target, permissions))
-        .and_then(|()| finish(&target))
+    copy_into_created(&mut source, &mut target, permissions, finish)
         .inspect_err(|_| {
             if path_still_names(&target, target_path) {
                 let _ = fs::remove_file(target_path);
             }
         })
+}
+
+/// The copy of [`copy_file_exclusive`] once both files are open: the
+/// bytes, then `permissions` asserted through `target`'s handle, then
+/// `finish`. The caller created `target` and removes it on failure.
+pub fn copy_into_created(
+    source: &mut fs::File,
+    target: &mut fs::File,
+    permissions: &CopyPermissions,
+    finish: impl FnOnce(&fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    io::copy(source, target)
+        .and_then(|_| set_file_permissions(target, permissions))
+        .and_then(|()| finish(target))
 }
 
 /// Copy `source_path` to `target_path`, so that a reader of the target

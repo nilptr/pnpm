@@ -5,75 +5,16 @@ use super::{
     FileImport,
     target_mode::{desired_mode, mode_is_linkable},
 };
-use pnpm_fs::file_mode::{is_cas_file_path, narrow_mode, widen_mode};
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, Stat};
+use pnpm_fs::{
+    AtPath,
+    file_mode::{is_cas_file_path, widen_mode},
+};
+use rustix::fs::AtFlags;
 use std::{
     fs, io,
-    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
-
-/// A path resolved relative to `dir`, or to the working directory for
-/// [`AtPath::cwd`].
-#[derive(Clone, Copy)]
-pub(crate) struct AtPath<'a> {
-    dir: BorrowedFd<'a>,
-    path: &'a Path,
-}
-
-impl<'a> AtPath<'a> {
-    pub(crate) fn new(dir: BorrowedFd<'a>, path: &'a Path) -> Self {
-        AtPath { dir, path }
-    }
-
-    pub(crate) fn cwd(path: &'a Path) -> Self {
-        AtPath { dir: CWD, path }
-    }
-
-    fn stat(self) -> io::Result<Stat> {
-        Ok(rustix::fs::statat(self.dir, self.path, AtFlags::SYMLINK_NOFOLLOW)?)
-    }
-
-    fn open(self, flags: OFlags, mode: Mode) -> io::Result<OwnedFd> {
-        Ok(rustix::fs::openat(self.dir, self.path, flags | OFlags::CLOEXEC, mode)?)
-    }
-
-    fn open_source(self) -> io::Result<OwnedFd> {
-        self.open(OFlags::RDONLY, Mode::empty())
-    }
-
-    /// Create a file nothing occupies yet. `O_EXCL` does not follow a
-    /// symlink squatting at the path.
-    fn create_new(self, mode: u32) -> io::Result<OwnedFd> {
-        self.open(
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            Mode::from_raw_mode(narrow_mode(mode)?),
-        )
-    }
-
-    /// Open a directory, for other paths to resolve relative to.
-    pub(crate) fn open_dir(self) -> io::Result<OwnedFd> {
-        self.open(OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
-    }
-
-    /// Create a directory whose parent exists. A directory already there,
-    /// or a symlink to one, counts as created, as in [`fs::create_dir_all`].
-    pub(crate) fn create_dir(self) -> io::Result<()> {
-        match rustix::fs::mkdirat(self.dir, self.path, Mode::from_raw_mode(0o777)) {
-            Err(rustix::io::Errno::EXIST) if self.is_dir() => Ok(()),
-            result => Ok(result?),
-        }
-    }
-
-    fn is_dir(self) -> bool {
-        rustix::fs::statat(self.dir, self.path, AtFlags::empty())
-            .is_ok_and(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir())
-    }
-
-    fn remove_file(self) -> io::Result<()> {
-        Ok(rustix::fs::unlinkat(self.dir, self.path, AtFlags::empty())?)
-    }
-}
 
 /// An open store `files` directory. A store entry's source then resolves
 /// as `<shard>/<digest>` below it.
@@ -132,13 +73,7 @@ impl<'a> AtImport<'a> {
     /// Remove a target this import created and failed to finish, unless a
     /// concurrent writer has since replaced it with a complete file.
     fn remove_created(&self, created: impl AsFd) {
-        let still_named = match (rustix::fs::fstat(created), self.target.stat()) {
-            (Ok(created), Ok(current)) => {
-                created.st_ino == current.st_ino && created.st_dev == current.st_dev
-            }
-            _ => false,
-        };
-        if still_named {
+        if self.target.still_names(created) {
             let _ = self.target.remove_file();
         }
     }
@@ -147,10 +82,10 @@ impl<'a> AtImport<'a> {
 impl FileImport for AtImport<'_> {
     fn hard_link(&self) -> io::Result<()> {
         Ok(rustix::fs::linkat(
-            self.source.dir,
-            self.source.path,
-            self.target.dir,
-            self.target.path,
+            self.source.dir(),
+            self.source.path(),
+            self.target.dir(),
+            self.target.path(),
             AtFlags::empty(),
         )?)
     }
@@ -166,9 +101,9 @@ impl FileImport for AtImport<'_> {
             // and both descriptors are borrowed for it.
             let result = unsafe {
                 libc::clonefileat(
-                    self.source.dir.as_raw_fd(),
+                    self.source.dir().as_raw_fd(),
                     source.as_ptr(),
-                    self.target.dir.as_raw_fd(),
+                    self.target.dir().as_raw_fd(),
                     target.as_ptr(),
                     rustix::fs::CloneFlags::NOOWNERCOPY.bits(),
                 )
@@ -179,16 +114,20 @@ impl FileImport for AtImport<'_> {
                 Err(Errno::from_io_error(&io::Error::last_os_error()).unwrap_or(Errno::IO))
             }
         };
-        Ok(self.source.path.into_with_c_str(|source| {
-            self.target.path.into_with_c_str(|target| clone(source, target))
-        })?)
+        Ok(self.source
+            .path()
+            .into_with_c_str(|source| {
+                self.target.path().into_with_c_str(|target| clone(source, target))
+            })?)
     }
 
     /// `FICLONE` onto a target created at the mode it finishes with, so
     /// [`Self::align_target_mode`] has nothing left to do.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn reflink(&self) -> io::Result<()> {
-        let source = self.source.open_source()?;
+        use pnpm_fs::file_mode::narrow_mode;
+        use rustix::fs::Mode;
+        let source = self.source.open_read()?;
         let mode = self.copy_mode(&source)?;
         let target = self.target.create_new(mode)?;
         let cloned = rustix::fs::ioctl_ficlone(&target, &source)
@@ -210,18 +149,13 @@ impl FileImport for AtImport<'_> {
     }
 
     fn copy(&self) -> io::Result<()> {
-        let mut source = fs::File::from(self.source.open_source()?);
+        use std::os::unix::fs::PermissionsExt;
+        let mut source = fs::File::from(self.source.open_read()?);
         let mode = self.copy_mode(&source)?;
         let mut target = fs::File::from(self.target.create_new(mode)?);
-        // The umask may have narrowed the creation mode.
-        let copied = io::copy(&mut source, &mut target)
-            .and_then(|_| {
-                Ok(rustix::fs::fchmod(&target, Mode::from_raw_mode(narrow_mode(mode)?))?)
-            });
-        if copied.is_err() {
-            self.remove_created(&target);
-        }
-        copied
+        let permissions = fs::Permissions::from_mode(mode);
+        pnpm_fs::copy_into_created(&mut source, &mut target, &permissions, |_| Ok(()))
+            .inspect_err(|_| self.remove_created(&target))
     }
 
     /// `clonefile` gives the clone the source's mode. Elsewhere the clone
@@ -229,6 +163,7 @@ impl FileImport for AtImport<'_> {
     fn align_target_mode(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         if let Some(mode) = desired_mode(self.source_path) {
+            use pnpm_fs::file_mode::narrow_mode;
             let stat = self.target.stat()?;
             if rustix::fs::FileType::from_raw_mode(stat.st_mode)
                 != rustix::fs::FileType::RegularFile
@@ -239,9 +174,9 @@ impl FileImport for AtImport<'_> {
             }
             if widen_mode(stat.st_mode) & 0o7777 != mode {
                 rustix::fs::chmodat(
-                    self.target.dir,
-                    self.target.path,
-                    Mode::from_raw_mode(narrow_mode(mode)?),
+                    self.target.dir(),
+                    self.target.path(),
+                    rustix::fs::Mode::from_raw_mode(narrow_mode(mode)?),
                     AtFlags::SYMLINK_NOFOLLOW,
                 )?;
             }
@@ -259,3 +194,6 @@ impl FileImport for AtImport<'_> {
         self.target.remove_file()
     }
 }
+
+#[cfg(test)]
+mod tests;
