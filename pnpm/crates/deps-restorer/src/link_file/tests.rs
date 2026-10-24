@@ -9,10 +9,81 @@ mod installation;
 #[cfg(unix)]
 use super::Host;
 use super::{FsHardLink, FsReflink};
+use pnpm_store_dir::{
+    CafsFileInfo, PackageFilesIndex, PendingFilesCheck, StoreDir, StoreFilesCheck,
+    VerifiedFilesCache, defer_pkg_files_integrity,
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+/// A store-index row recording store entries, and the check an import
+/// runs against it. Each file is `(filename, store path, size,
+/// checked_at)`. Its digest is the one its store path spells, so an
+/// entry whose content is not that digest's fails once the check hashes
+/// it.
+pub(crate) struct RecordedStoreFiles {
+    pending: PendingFilesCheck,
+    cache: VerifiedFilesCache,
+}
+
+impl RecordedStoreFiles {
+    pub(crate) fn new(store_root: &Path, files: &[(&str, &Path, u64, Option<u64>)]) -> Self {
+        let files = files
+            .iter()
+            .map(|(filename, path, size, checked_at)| {
+                let name = path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                let shard = path
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                let digest_tail = name.strip_suffix("-exec");
+                let info = CafsFileInfo {
+                    digest: format!("{shard}{}", digest_tail.unwrap_or(name)),
+                    mode: if digest_tail.is_some() { 0o755 } else { 0o644 },
+                    size: *size,
+                    checked_at: *checked_at,
+                };
+                ((*filename).to_string(), info)
+            })
+            .collect();
+        let index = PackageFilesIndex {
+            manifest: None,
+            requires_build: None,
+            requires_prepare: None,
+            algo: "sha512".to_string(),
+            files,
+            side_effects: None,
+            remote_side_effects_quarantine: None,
+        };
+        let (_, pending) = defer_pkg_files_integrity(&StoreDir::new(store_root), index);
+        RecordedStoreFiles { pending, cache: VerifiedFilesCache::new() }
+    }
+
+    pub(crate) fn check(&self) -> StoreFilesCheck<'_> {
+        StoreFilesCheck::new(&self.pending, &self.cache)
+    }
+}
+
+/// A `checked_at` no file written before the call is modified past.
+pub(crate) fn now_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
 
 fn write_source(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
     let path = dir.join(name);

@@ -3,6 +3,7 @@ use super::{
     clear_dirent_blocking_dir, dir_fits_at, entries_by_target_dir, file_fits_at, populate_dir,
     symlinks::{SymlinkRoots, final_link_target},
 };
+use crate::link_file::{RecordedStoreFiles, now_ms};
 use pnpm_config::PackageImportMethod;
 use pnpm_reporter::SilentReporter;
 use std::{
@@ -82,6 +83,7 @@ fn a_directory_has_one_writer_at_a_time() {
         &target,
         &cas_paths,
         Placement::Fresh,
+        None,
         None,
     )
     .unwrap();
@@ -349,6 +351,7 @@ fn a_fresh_import_links_store_entries_into_nested_directories() {
         &cas_paths,
         Placement::Fresh,
         None,
+        None,
     )
     .unwrap();
 
@@ -373,6 +376,7 @@ fn a_fresh_copy_carries_the_store_entry_mode() {
         &target,
         &cas_paths,
         Placement::Fresh,
+        None,
         None,
     )
     .unwrap();
@@ -400,6 +404,7 @@ fn a_fresh_hardlink_of_a_store_entry_with_a_wider_mode_is_replaced_by_a_copy() {
         &target,
         &cas_paths,
         Placement::Fresh,
+        None,
         None,
     )
     .unwrap();
@@ -430,6 +435,7 @@ fn a_fresh_import_adopts_a_file_a_concurrent_importer_placed() {
         &cas_paths,
         Placement::Fresh,
         None,
+        None,
     )
     .unwrap();
 
@@ -457,6 +463,7 @@ fn a_fresh_import_reports_the_file_where_a_directory_belongs() {
         &target,
         &cas_paths,
         Placement::Fresh,
+        None,
         None,
     )
     .unwrap_err();
@@ -488,6 +495,7 @@ fn a_fresh_clone_or_copy_carries_the_store_entry_mode() {
         &cas_paths,
         Placement::Fresh,
         None,
+        None,
     )
     .unwrap();
 
@@ -497,4 +505,124 @@ fn a_fresh_clone_or_copy_carries_the_store_entry_mode() {
         assert_eq!(mode_of(&target.join(entry)), store_mode(executable), "{entry}");
     }
     assert_eq!(mode_of(&cas_paths["lib/index.js"]), 0o666);
+}
+
+/// A package of two store entries: `index.js`, whose entry's content is
+/// not what its digest says, and the `package.json` marker, whose entry
+/// is checked after the content was written.
+struct CheckedPackage {
+    root: tempfile::TempDir,
+    cas_paths: HashMap<String, PathBuf>,
+    index: PathBuf,
+    recorded: RecordedStoreFiles,
+}
+
+impl CheckedPackage {
+    fn new() -> Self {
+        let root = tempdir().unwrap();
+        let store = root.path().join("store");
+        let shard = store.join("files/1b");
+        fs::create_dir_all(&shard).unwrap();
+        let index = shard.join("59d9e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8");
+        fs::write(&index, b"not the digest's content").unwrap();
+        let manifest = shard.join("a".repeat(40));
+        fs::write(&manifest, b"{}").unwrap();
+        let recorded = RecordedStoreFiles::new(
+            &store,
+            &[("index.js", &index, 24, Some(0)), ("package.json", &manifest, 2, Some(now_ms()))],
+        );
+        let cas_paths = HashMap::from([
+            ("index.js".to_string(), index.clone()),
+            ("package.json".to_string(), manifest),
+        ]);
+        CheckedPackage { root, cas_paths, index, recorded }
+    }
+
+    fn target(&self) -> PathBuf {
+        self.root.path().join("pkg")
+    }
+
+    fn populate(&self, placement: Placement) -> Result<(), super::ImportIndexedDirError> {
+        populate_dir::<SilentReporter>(
+            &AtomicU8::new(0),
+            PackageImportMethod::Hardlink,
+            &self.target(),
+            &self.cas_paths,
+            placement,
+            None,
+            Some(&self.recorded.check()),
+        )
+    }
+}
+
+#[test]
+fn a_stale_store_file_stops_a_fresh_import_before_the_marker_and_is_not_left_behind() {
+    let package = CheckedPackage::new();
+
+    let error = package.populate(Placement::Fresh).unwrap_err();
+
+    assert_eq!(error.stale_store_file(), Some(package.index.as_path()), "{error}");
+    assert!(
+        !package
+            .target()
+            .join("index.js")
+            .exists()
+    );
+    assert!(
+        !package
+            .target()
+            .join("package.json")
+            .exists(),
+        "the marker goes down last"
+    );
+}
+
+/// A repair keeps a file that matches its store entry without placing
+/// it, so the store files are checked by their paths before anything is
+/// compared.
+#[test]
+fn a_repair_checks_the_store_files_first() {
+    let package = CheckedPackage::new();
+    fs::create_dir(package.target()).unwrap();
+    fs::hard_link(&package.index, package.target().join("index.js")).unwrap();
+
+    let error = package.populate(Placement::Repair).unwrap_err();
+
+    assert_eq!(error.stale_store_file(), Some(package.index.as_path()), "{error}");
+    assert!(
+        !package
+            .target()
+            .join("package.json")
+            .exists()
+    );
+}
+
+/// A complete slot imports nothing, so its store files are checked by
+/// their paths: fetching the package again repairs a stale store file in
+/// place, which heals the slot's link to it.
+#[test]
+fn a_complete_import_still_checks_its_store_files() {
+    use crate::{ImportIndexedDirOpts, import_indexed_dir};
+
+    let package = CheckedPackage::new();
+    let import = |files_check| {
+        import_indexed_dir::<SilentReporter>(
+            &AtomicU8::new(0),
+            PackageImportMethod::Hardlink,
+            &package.target(),
+            &package.cas_paths,
+            ImportIndexedDirOpts { files_check, ..ImportIndexedDirOpts::default() },
+        )
+    };
+    import(None).unwrap();
+    assert!(
+        package
+            .target()
+            .join("package.json")
+            .exists()
+    );
+
+    let error = import(Some(&package.recorded.check())).unwrap_err();
+
+    assert_eq!(error.stale_store_file(), Some(package.index.as_path()), "{error}");
 }

@@ -4,12 +4,15 @@
 use super::{
     FileImport,
     target_mode::{desired_mode, mode_is_linkable},
+    verify_store_file,
 };
 use pnpm_fs::{
     AtPath,
     file_mode::{is_cas_file_path, widen_mode},
+    stat_mtime_ms,
 };
-use rustix::fs::AtFlags;
+use pnpm_store_dir::StoreFileCheck;
+use rustix::fs::{AtFlags, Stat};
 use std::{
     fs, io,
     os::fd::{AsFd, OwnedFd},
@@ -54,20 +57,38 @@ pub(crate) struct AtImport<'a> {
     source_path: &'a Path,
     source: AtPath<'a>,
     target: AtPath<'a>,
+    check: Option<StoreFileCheck<'a>>,
 }
 
 impl<'a> AtImport<'a> {
-    pub(crate) fn new(source_path: &'a Path, source: AtPath<'a>, target: AtPath<'a>) -> Self {
-        AtImport { source_path, source, target }
+    pub(crate) fn new(
+        source_path: &'a Path,
+        source: AtPath<'a>,
+        target: AtPath<'a>,
+        check: Option<StoreFileCheck<'a>>,
+    ) -> Self {
+        AtImport { source_path, source, target, check }
     }
 
     /// The mode a copy of the source carries: the store-entry mode, or the
     /// open source's own permission bits.
-    fn copy_mode(&self, source: impl AsFd) -> io::Result<u32> {
-        match desired_mode(self.source_path) {
-            Some(mode) => Ok(mode),
-            None => Ok(widen_mode(rustix::fs::fstat(source)?.st_mode) & 0o7777),
+    fn copy_mode(&self, source: &Stat) -> u32 {
+        desired_mode(self.source_path).unwrap_or_else(|| widen_mode(source.st_mode) & 0o7777)
+    }
+
+    /// Check the source's inode, read as `stat`, before anything is placed.
+    fn verify(&self, stat: &Stat) -> io::Result<()> {
+        verify_store_file(self.check, self.source_path, Some(stat_mtime_ms(stat)))
+    }
+
+    /// [`Self::verify`] for the inode now at the target, which is unlinked
+    /// when it fails so a later import does not adopt it.
+    fn verify_placed(&self, stat: &Stat) -> io::Result<()> {
+        let verified = self.verify(stat);
+        if verified.is_err() {
+            self.target.remove_file()?;
         }
+        verified
     }
 
     /// Remove a target this import created and failed to finish, unless a
@@ -90,6 +111,9 @@ impl FileImport for AtImport<'_> {
         )?)
     }
 
+    /// `clonefileat` gives the clone the source's attributes, its
+    /// modification time included, so [`Self::align_target_mode`] checks
+    /// the clone.
     #[cfg(target_os = "macos")]
     fn reflink(&self) -> io::Result<()> {
         use rustix::{io::Errno, path::Arg};
@@ -128,7 +152,9 @@ impl FileImport for AtImport<'_> {
         use pnpm_fs::file_mode::narrow_mode;
         use rustix::fs::Mode;
         let source = self.source.open_read()?;
-        let mode = self.copy_mode(&source)?;
+        let stat = rustix::fs::fstat(&source)?;
+        self.verify(&stat)?;
+        let mode = self.copy_mode(&stat);
         let target = self.target.create_new(mode)?;
         let cloned = rustix::fs::ioctl_ficlone(&target, &source)
             .map_err(io::Error::from)
@@ -151,7 +177,9 @@ impl FileImport for AtImport<'_> {
     fn copy(&self) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let mut source = fs::File::from(self.source.open_read()?);
-        let mode = self.copy_mode(&source)?;
+        let stat = rustix::fs::fstat(&source)?;
+        self.verify(&stat)?;
+        let mode = self.copy_mode(&stat);
         let mut target = fs::File::from(self.target.create_new(mode)?);
         let permissions = fs::Permissions::from_mode(mode);
         pnpm_fs::copy_into_created(&mut source, &mut target, &permissions, |_| Ok(()))
@@ -162,36 +190,46 @@ impl FileImport for AtImport<'_> {
     /// was created at the desired mode.
     fn align_target_mode(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
-        if let Some(mode) = desired_mode(self.source_path) {
-            use pnpm_fs::file_mode::narrow_mode;
-            let stat = self.target.stat()?;
-            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
-                != rustix::fs::FileType::RegularFile
-            {
-                // The permission change must not reach what a squatting
-                // symlink names.
-                return Err(rustix::io::Errno::LOOP.into());
-            }
-            if widen_mode(stat.st_mode) & 0o7777 != mode {
-                rustix::fs::chmodat(
-                    self.target.dir(),
-                    self.target.path(),
-                    rustix::fs::Mode::from_raw_mode(narrow_mode(mode)?),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )?;
+        {
+            let desired = desired_mode(self.source_path);
+            if desired.is_some() || self.check.is_some() {
+                use pnpm_fs::file_mode::narrow_mode;
+                let stat = self.target.stat()?;
+                if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    != rustix::fs::FileType::RegularFile
+                {
+                    // The permission change must not reach what a squatting
+                    // symlink names.
+                    return Err(rustix::io::Errno::LOOP.into());
+                }
+                self.verify_placed(&stat)?;
+                if let Some(mode) = desired
+                    && widen_mode(stat.st_mode) & 0o7777 != mode
+                {
+                    rustix::fs::chmodat(
+                        self.target.dir(),
+                        self.target.path(),
+                        rustix::fs::Mode::from_raw_mode(narrow_mode(mode)?),
+                        AtFlags::SYMLINK_NOFOLLOW,
+                    )?;
+                }
             }
         }
         Ok(())
     }
 
     fn linked_mode_is_linkable(&self) -> io::Result<bool> {
-        mode_is_linkable(self.source_path, || {
-            self.target.stat().map(|stat| widen_mode(stat.st_mode))
-        })
+        let stat = self.target.stat()?;
+        self.verify_placed(&stat)?;
+        mode_is_linkable(self.source_path, || Ok(widen_mode(stat.st_mode)))
     }
 
     fn remove_target(&self) -> io::Result<()> {
         self.target.remove_file()
+    }
+
+    fn source_is_stale(&self) -> bool {
+        self.check.is_some_and(|check| !check.passes_at(self.source_path))
     }
 }
 

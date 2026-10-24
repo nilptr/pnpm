@@ -46,13 +46,16 @@ impl CreateVirtualStore<'_> {
     }
 
     /// Run the files checks the prefetch deferred for the rows whose
-    /// files this install may import: every survivor, and every skipped
-    /// snapshot whose row carries a side-effects overlay, which the
-    /// build phase's cache hit materializes into the slot. A row whose
-    /// CAFS files have gone missing is dropped and re-fetched. The other
-    /// skipped snapshots keep their rows unchecked: nothing imports
-    /// their files, and their manifests and `requiresBuild` flags come
-    /// from the row itself.
+    /// files this install imports without checking them on the way:
+    /// every skipped snapshot whose row carries a side-effects overlay,
+    /// which the build phase's cache hit materializes into the slot, and
+    /// under the hoisted linker every survivor too. The isolated linkers
+    /// check a survivor's files as they import them (see
+    /// [`pnpm_store_dir::StoreFilesCheck`]), so their rows stay pending
+    /// for that. A row whose CAFS files have gone missing is dropped and
+    /// re-fetched. The other skipped snapshots keep their rows unchecked:
+    /// nothing imports their files, and their manifests and
+    /// `requiresBuild` flags come from the row itself.
     async fn verify_imported_rows(
         &self,
         mut prefetched: PrefetchResult,
@@ -62,7 +65,7 @@ impl CreateVirtualStore<'_> {
         if prefetched.pending_checks.is_empty() {
             return prefetched;
         }
-        let imported_keys = imported_cache_keys(plan, &prefetched);
+        let imported_keys = imported_cache_keys(plan, &prefetched, self.is_hoisted());
         let store_dir: &'static StoreDir = &self.ctx.config.store_dir;
         let verified_files_cache = SharedVerifiedFilesCache::clone(verified_files_cache);
         tokio::task::spawn_blocking(move || {
@@ -96,9 +99,11 @@ impl CreateVirtualStore<'_> {
 fn imported_cache_keys(
     plan: &snapshot_plan::SnapshotPlan<'_>,
     prefetched: &PrefetchResult,
+    check_survivors: bool,
 ) -> Vec<String> {
     plan.survivors
         .iter()
+        .filter(|_| check_survivors)
         .filter_map(|(_, _, cache_key)| cache_key.clone())
         .chain(
             plan.skipped_entries

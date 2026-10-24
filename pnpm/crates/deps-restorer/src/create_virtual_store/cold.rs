@@ -21,6 +21,7 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone, Copy)]
 pub(super) struct ColdInputs<'i, 'a> {
     pub(super) wanted: WantedEntries<'a>,
     pub(super) store: CreateVirtualStoreStoreContext<'i>,

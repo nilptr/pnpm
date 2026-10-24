@@ -42,6 +42,7 @@ const FORCE_KEEP: ImportIndexedDirOpts = ImportIndexedDirOpts {
     keep_modules_dir: true,
     safe_to_skip: false,
     preserve_symlinks: false,
+    files_check: None,
 };
 const FORCE_ONLY: ImportIndexedDirOpts = ImportIndexedDirOpts {
     force: true,
@@ -49,6 +50,7 @@ const FORCE_ONLY: ImportIndexedDirOpts = ImportIndexedDirOpts {
     keep_modules_dir: false,
     safe_to_skip: false,
     preserve_symlinks: false,
+    files_check: None,
 };
 const FORCE_SHARED: ImportIndexedDirOpts = ImportIndexedDirOpts {
     force: true,
@@ -56,6 +58,7 @@ const FORCE_SHARED: ImportIndexedDirOpts = ImportIndexedDirOpts {
     keep_modules_dir: false,
     safe_to_skip: true,
     preserve_symlinks: false,
+    files_check: None,
 };
 // The shape the isolated linker uses for a shared slot: no force, since a warm slot is
 // short-circuited by its marker before the import runs.
@@ -65,6 +68,7 @@ const SHARED: ImportIndexedDirOpts = ImportIndexedDirOpts {
     keep_modules_dir: false,
     safe_to_skip: true,
     preserve_symlinks: false,
+    files_check: None,
 };
 // The shape the isolated linker uses for a shared slot whose build was interrupted.
 #[cfg(unix)]
@@ -74,4 +78,5 @@ const FORCE_SHARED_KEEP: ImportIndexedDirOpts = ImportIndexedDirOpts {
     keep_modules_dir: true,
     safe_to_skip: true,
     preserve_symlinks: false,
+    files_check: None,
 };

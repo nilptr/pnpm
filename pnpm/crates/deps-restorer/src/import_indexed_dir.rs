@@ -16,6 +16,7 @@ use derive_more::{Display, Error};
 use miette::Diagnostic;
 use pnpm_config::PackageImportMethod;
 use pnpm_reporter::Reporter;
+use pnpm_store_dir::StoreFilesCheck;
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -32,7 +33,7 @@ use std::{
 /// shape (no force, no nested-modules preservation); the hoisted
 /// linker passes both flags set to `true`.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ImportIndexedDirOpts {
+pub struct ImportIndexedDirOpts<'a> {
     /// When `true`, re-import even when `dir_path` already exists,
     /// overwriting the existing contents. Without `force`, an
     /// existing directory short-circuits this function (matches
@@ -55,6 +56,15 @@ pub struct ImportIndexedDirOpts {
     /// When `true`, preserve safe symlinks in the imported package instead of
     /// assuming all entries are regular files.
     pub preserve_symlinks: bool,
+    /// The integrity check of the store files `cas_paths` names, run on
+    /// each file as it is imported. A file that fails stops the import
+    /// with [`LinkFileError::StaleStoreFile`] and is not left at the
+    /// target. An import that finds its files in place checks them by
+    /// their paths instead: fetching the package again repairs a store
+    /// file in place, which heals the files linked to it. Files the check
+    /// does not record, and every import without a check, import
+    /// unchecked.
+    pub files_check: Option<&'a StoreFilesCheck<'a>>,
 }
 
 /// Error type for [`import_indexed_dir`].
@@ -117,6 +127,18 @@ pub enum ImportIndexedDirError {
     },
     #[display("symlink target {target:?} escapes package root {root:?}")]
     SymlinkTargetEscapes { target: PathBuf, root: PathBuf },
+}
+
+impl ImportIndexedDirError {
+    /// The store file that failed [`ImportIndexedDirOpts::files_check`],
+    /// when that is what stopped the import.
+    #[must_use]
+    pub fn stale_store_file(&self) -> Option<&Path> {
+        match self {
+            ImportIndexedDirError::LinkFile(LinkFileError::StaleStoreFile { from }) => Some(from),
+            _ => None,
+        }
+    }
 }
 
 /// How [`populate_dir`] puts each indexed entry at its final path.
@@ -183,7 +205,7 @@ pub fn import_indexed_dir<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
-    opts: ImportIndexedDirOpts,
+    opts: ImportIndexedDirOpts<'_>,
 ) -> Result<(), ImportIndexedDirError> {
     let result = import_indexed_dir_once::<Reporter>(
         logged_methods,
@@ -241,7 +263,7 @@ fn import_indexed_dir_once<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
-    opts: ImportIndexedDirOpts,
+    opts: ImportIndexedDirOpts<'_>,
     repair_sanitized: bool,
 ) -> Result<(), ImportIndexedDirError> {
     let existing_kind = existing_dirent_kind(dir_path)?;
@@ -252,15 +274,10 @@ fn import_indexed_dir_once<Reporter: self::Reporter>(
     // per-install `xattr` cost — exactly pnpm's `!pkgExistsAtTargetDir` gate.
     let unquarantine = || remove_quarantine_from_native_binaries(dir_path, cas_paths);
     match (existing_kind, opts.force) {
-        (None, _) => import_absent_dir::<Reporter>(
-            logged_methods,
-            import_method,
-            dir_path,
-            cas_paths,
-            opts.safe_to_skip,
-            opts.preserve_symlinks,
-        )
-        .inspect(|()| unquarantine()),
+        (None, _) => {
+            import_absent_dir::<Reporter>(logged_methods, import_method, dir_path, cas_paths, opts)
+                .inspect(|()| unquarantine())
+        }
         // Short-circuit only when the completion marker is present
         // (pnpm's `pkgExistsAtTargetDir`, which checks `package.json`),
         // not on mere directory existence. A marker-less directory is a
@@ -300,7 +317,7 @@ fn force_import_existing_dir<Reporter: self::Reporter>(
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
     file_type: fs::FileType,
-    opts: ImportIndexedDirOpts,
+    opts: ImportIndexedDirOpts<'_>,
 ) -> Result<(), ImportIndexedDirError> {
     if !file_type.is_dir() {
         return replace_non_dir::<Reporter>(
@@ -309,7 +326,7 @@ fn force_import_existing_dir<Reporter: self::Reporter>(
             dir_path,
             cas_paths,
             file_type,
-            opts.preserve_symlinks,
+            opts,
         );
     }
     if opts.reuse_hardlinks
@@ -328,17 +345,10 @@ fn force_import_existing_dir<Reporter: self::Reporter>(
             import_method,
             dir_path,
             cas_paths,
-            opts.preserve_symlinks,
+            opts,
         );
     }
-    stage_and_swap::<Reporter>(
-        logged_methods,
-        import_method,
-        dir_path,
-        cas_paths,
-        opts.keep_modules_dir,
-        opts.preserve_symlinks,
-    )
+    stage_and_swap::<Reporter>(logged_methods, import_method, dir_path, cas_paths, opts)
 }
 
 /// The kind of dirent already at `path`, or `None` when nothing is
@@ -368,7 +378,7 @@ fn import_into_shared_dir<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
-    preserve_symlinks: bool,
+    opts: ImportIndexedDirOpts<'_>,
 ) -> Result<(), ImportIndexedDirError> {
     if claim_dir(dir_path)? {
         return populate_dir::<Reporter>(
@@ -377,11 +387,12 @@ fn import_into_shared_dir<Reporter: self::Reporter>(
             dir_path,
             cas_paths,
             Placement::Fresh,
-            preserve_symlinks.then_some(dir_path),
+            opts.preserve_symlinks.then_some(dir_path),
+            opts.files_check,
         );
     }
     if all_files_match(dir_path, cas_paths) {
-        return Ok(());
+        return check_files_in_place(cas_paths, opts.files_check);
     }
     populate_dir::<Reporter>(
         logged_methods,
@@ -389,8 +400,24 @@ fn import_into_shared_dir<Reporter: self::Reporter>(
         dir_path,
         cas_paths,
         Placement::Repair,
-        preserve_symlinks.then_some(dir_path),
+        opts.preserve_symlinks.then_some(dir_path),
+        opts.files_check,
     )
+}
+
+/// Run `files_check` on the store files of `cas_paths` by their paths,
+/// for an import that keeps the files already at the target (see
+/// [`ImportIndexedDirOpts::files_check`]).
+fn check_files_in_place(
+    cas_paths: &HashMap<String, PathBuf>,
+    files_check: Option<&StoreFilesCheck<'_>>,
+) -> Result<(), ImportIndexedDirError> {
+    match files_check.and_then(|check| check.stale_file(cas_paths)) {
+        Some(stale) => Err(ImportIndexedDirError::LinkFile(LinkFileError::StaleStoreFile {
+            from: stale.to_path_buf(),
+        })),
+        None => Ok(()),
+    }
 }
 
 /// Create `dir_path`, reporting whether this call is the one that created
@@ -418,17 +445,10 @@ fn import_absent_dir<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
-    safe_to_skip: bool,
-    preserve_symlinks: bool,
+    opts: ImportIndexedDirOpts<'_>,
 ) -> Result<(), ImportIndexedDirError> {
-    if safe_to_skip {
-        import_into_shared_dir::<Reporter>(
-            logged_methods,
-            import_method,
-            dir_path,
-            cas_paths,
-            preserve_symlinks,
-        )
+    if opts.safe_to_skip {
+        import_into_shared_dir::<Reporter>(logged_methods, import_method, dir_path, cas_paths, opts)
     } else {
         populate_dir::<Reporter>(
             logged_methods,
@@ -436,7 +456,8 @@ fn import_absent_dir<Reporter: self::Reporter>(
             dir_path,
             cas_paths,
             Placement::Fresh,
-            preserve_symlinks.then_some(dir_path),
+            opts.preserve_symlinks.then_some(dir_path),
+            opts.files_check,
         )
     }
 }
@@ -447,12 +468,12 @@ fn repair_existing_dir<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
-    opts: ImportIndexedDirOpts,
+    opts: ImportIndexedDirOpts<'_>,
     repair_sanitized: bool,
 ) -> Result<(), ImportIndexedDirError> {
     // The first import may have left files that do not match the sanitized map.
     if !repair_sanitized && marker_present(dir_path, cas_paths) {
-        Ok(())
+        check_files_in_place(cas_paths, opts.files_check)
     } else {
         populate_dir::<Reporter>(
             logged_methods,
@@ -461,6 +482,7 @@ fn repair_existing_dir<Reporter: self::Reporter>(
             cas_paths,
             Placement::for_target(opts.safe_to_skip || repair_sanitized),
             opts.preserve_symlinks.then_some(dir_path),
+            opts.files_check,
         )
         .inspect(|()| remove_quarantine_from_native_binaries(dir_path, cas_paths))
     }
@@ -472,7 +494,7 @@ fn replace_non_dir<Reporter: self::Reporter>(
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
     file_type: fs::FileType,
-    preserve_symlinks: bool,
+    opts: ImportIndexedDirOpts<'_>,
 ) -> Result<(), ImportIndexedDirError> {
     remove_non_dir_dirent(dir_path, file_type)
         .map_err(|error| ImportIndexedDirError::ClearNonDirEntry {
@@ -485,7 +507,8 @@ fn replace_non_dir<Reporter: self::Reporter>(
         dir_path,
         cas_paths,
         Placement::Fresh,
-        preserve_symlinks.then_some(dir_path),
+        opts.preserve_symlinks.then_some(dir_path),
+        opts.files_check,
     )
 }
 

@@ -64,10 +64,14 @@ fn not_found_with_a_dangling_symlink_at_either_path_propagates() {
     let dst = write_source(tmp.path(), "dst", b"data\n");
 
     for (src, dst) in [(src, dangling("dangling-dst")), (dangling("dangling-src"), dst)] {
-        let error =
-            recover_from_concurrent_import(io::Error::from(io::ErrorKind::NotFound), &src, &dst)
-                .expect_err("a dangling symlink is corruption, not a concurrent writer");
-        let LinkFileError::Import { error, .. } = error;
+        let error = recover_from_concurrent_import(
+            io::Error::from(io::ErrorKind::NotFound),
+            &PathImport::<Host>::new(&src, &dst),
+            &src,
+            &dst,
+        )
+        .expect_err("a dangling symlink is corruption, not a concurrent writer");
+        let LinkFileError::Import { error, .. } = error else { panic!("expected an import error") };
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }

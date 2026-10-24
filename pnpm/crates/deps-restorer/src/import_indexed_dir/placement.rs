@@ -1,10 +1,11 @@
 pub(super) mod symlinks;
 
 use super::{ImportIndexedDirError, Placement, remove_non_dir_dirent, staging::import_atomic};
-use crate::{import_into_fresh_target, link_pool::in_link_pool};
+use crate::{LinkFileError, link_file::import_checked_into_fresh_target, link_pool::in_link_pool};
 use pnpm_config::PackageImportMethod;
 use pnpm_fs::Host;
 use pnpm_reporter::Reporter;
+use pnpm_store_dir::{StoreFileCheck, StoreFilesCheck};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -28,6 +29,10 @@ use symlinks::{
 /// `Some`, an entry whose source is a symlink is recreated as one, and
 /// the value names the directory `dir_path` is finally moved to, which a
 /// staged import writes elsewhere first.
+///
+/// `files_check` is [`super::ImportIndexedDirOpts::files_check`]. A
+/// [`Placement::Repair`] keeps a file that already matches its store
+/// entry, so it checks every store file by its path first.
 pub(super) fn populate_dir<Reporter: self::Reporter>(
     logged_methods: &AtomicU8,
     import_method: PackageImportMethod,
@@ -35,6 +40,7 @@ pub(super) fn populate_dir<Reporter: self::Reporter>(
     cas_paths: &HashMap<String, PathBuf>,
     placement: Placement,
     symlinks_final_dir: Option<&Path>,
+    files_check: Option<&StoreFilesCheck<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
     // Creating the directories and placing the marker are metadata writes
     // like the entries, so the whole import runs on the link pool.
@@ -46,6 +52,7 @@ pub(super) fn populate_dir<Reporter: self::Reporter>(
             cas_paths,
             placement,
             symlinks_final_dir,
+            files_check,
         )
     })
 }
@@ -57,6 +64,7 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
     cas_paths: &HashMap<String, PathBuf>,
     placement: Placement,
     symlinks_final_dir: Option<&Path>,
+    files_check: Option<&StoreFilesCheck<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
     #[cfg(unix)]
     if placement == Placement::Fresh && symlinks_final_dir.is_none() {
@@ -65,8 +73,21 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
             import_method,
             dir_path,
             cas_paths,
+            files_check,
         );
     }
+    if placement == Placement::Repair
+        && let Some(stale) = files_check.and_then(|check| check.stale_file(cas_paths))
+    {
+        return Err(ImportIndexedDirError::LinkFile(LinkFileError::StaleStoreFile {
+            from: stale.to_path_buf(),
+        }));
+    }
+    let entry_check = |store_path: &Path| {
+        files_check
+            .filter(|_| placement == Placement::Fresh)
+            .and_then(|check| check.file(store_path))
+    };
     create_indexed_dirs(dir_path, cas_paths, placement)?;
     let imported = symlinks_final_dir.map(|_| imported_paths(cas_paths));
     let symlinks = symlinks_final_dir
@@ -93,6 +114,7 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
                         store_path,
                         &dir_path.join(cleaned_entry),
                         symlinks,
+                        entry_check(store_path),
                     )
                 })
         })?;
@@ -105,6 +127,7 @@ fn populate_dir_on_current_pool<Reporter: self::Reporter>(
             &cas_paths[marker],
             &dir_path.join(marker),
             symlinks,
+            entry_check(&cas_paths[marker]),
         )?;
     }
     Ok(())
@@ -119,6 +142,7 @@ fn populate_fresh_dir_at<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
+    files_check: Option<&StoreFilesCheck<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
     use crate::StoreFilesDir;
     use std::os::fd::AsFd;
@@ -132,6 +156,7 @@ fn populate_fresh_dir_at<Reporter: self::Reporter>(
         dir_path,
         root: root.as_fd(),
         store_files: store_files.as_ref(),
+        files_check,
     };
     entries_by_target_dir(cas_paths, marker)
         .par_iter()
@@ -146,6 +171,7 @@ fn populate_fresh_dir_at<Reporter: self::Reporter>(
             &cas_paths[marker],
             &dir_path.join(marker),
             None,
+            files_check.and_then(|check| check.file(&cas_paths[marker])),
         )?;
     }
     Ok(())
@@ -160,6 +186,7 @@ struct FreshAtPlacing<'a> {
     /// `dir_path`, open.
     root: std::os::fd::BorrowedFd<'a>,
     store_files: Option<&'a crate::StoreFilesDir>,
+    files_check: Option<&'a StoreFilesCheck<'a>>,
 }
 
 #[cfg(unix)]
@@ -192,6 +219,7 @@ impl FreshAtPlacing<'_> {
                     store_path,
                     StoreFilesDir::locate(self.store_files, store_path),
                     AtPath::new(dir, name),
+                    self.files_check.and_then(|check| check.file(store_path)),
                 );
                 import_fresh::<Reporter, _>(
                     self.logged_methods,
@@ -361,6 +389,7 @@ fn place_entry<Reporter: self::Reporter>(
     store_path: &Path,
     target: &Path,
     symlinks: Option<SymlinkRoots<'_>>,
+    check: Option<StoreFileCheck<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
     if let Some(roots) = symlinks
         && is_symlink(store_path)
@@ -369,16 +398,20 @@ fn place_entry<Reporter: self::Reporter>(
         return Ok(());
     }
     match placement {
-        Placement::Fresh => {
-            import_into_fresh_target::<Reporter>(logged_methods, import_method, store_path, target)
-                .map_err(ImportIndexedDirError::LinkFile)
-        }
+        Placement::Fresh => import_checked_into_fresh_target::<Reporter>(
+            logged_methods,
+            import_method,
+            store_path,
+            target,
+            check,
+        )
+        .map_err(ImportIndexedDirError::LinkFile),
         Placement::Repair => {
             if file_matches_store_entry(target, store_path) {
                 return Ok(());
             }
             clear_dir_blocking_file::<Host>(target)?;
-            import_atomic::<Reporter>(logged_methods, import_method, store_path, target)
+            import_atomic::<Reporter>(logged_methods, import_method, store_path, target, check)
         }
     }
 }
@@ -394,6 +427,7 @@ fn place_marker<Reporter: self::Reporter>(
     store_path: &Path,
     target: &Path,
     symlinks: Option<SymlinkRoots<'_>>,
+    check: Option<StoreFileCheck<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
     if let Some(roots) = symlinks
         && is_symlink(store_path)
@@ -404,7 +438,7 @@ fn place_marker<Reporter: self::Reporter>(
     if placement == Placement::Repair {
         clear_dir_blocking_file::<Host>(target)?;
     }
-    import_atomic::<Reporter>(logged_methods, import_method, store_path, target)
+    import_atomic::<Reporter>(logged_methods, import_method, store_path, target, check)
 }
 
 /// Remove a directory tree standing where a package file belongs, as

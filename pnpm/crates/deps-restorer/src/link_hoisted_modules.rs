@@ -562,7 +562,7 @@ fn import_node<Reporter: self::Reporter>(
 /// nested `node_modules` other nodes were hoisted into. A directory
 /// dependency keeps its own symlinks. A missing mutable source leaves an
 /// existing directory alone, as it does for a virtual-store slot.
-fn hoisted_import_opts(files: &HoistedPackageFiles) -> ImportIndexedDirOpts {
+fn hoisted_import_opts(files: &HoistedPackageFiles) -> ImportIndexedDirOpts<'static> {
     ImportIndexedDirOpts {
         force: files.source_exists || !files.source_is_mutable,
         keep_modules_dir: true,

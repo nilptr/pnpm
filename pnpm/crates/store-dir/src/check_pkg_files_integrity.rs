@@ -5,7 +5,7 @@
 //! entirely when the caller opted out of integrity verification.
 pub use package_dir_matches_index::package_dir_matches_index;
 
-pub use pending_files_check::PendingFilesCheck;
+pub use pending_files_check::{PendingFilesCheck, StoreFileCheck, StoreFilesCheck};
 
 use crate::{
     CafsFileInfo, PackageFilesIndex, SideEffectsDiff, SideEffectsOverlay, StoreDir,
@@ -580,16 +580,28 @@ fn scrub_directory_at_cafs_path(path: &Path) {
 /// first time an old-format row is read (as pnpm also does).
 fn check_file(path: &Path, checked_at: Option<u64>) -> Option<(bool, u64)> {
     let meta = fs::metadata(path).ok()?;
-    let mtime_ms = meta
+    let mtime_ms = metadata_mtime_ms(&meta)?;
+    Some((is_modified_since(mtime_ms, checked_at), meta.len()))
+}
+
+/// Whether a file last modified at `mtime_ms` changed after the check
+/// recorded at `checked_at`, with the slack [`check_file`] describes.
+fn is_modified_since(mtime_ms: u64, checked_at: Option<u64>) -> bool {
+    mtime_ms.saturating_sub(checked_at.unwrap_or(0)) > 100
+}
+
+/// The modification time of `meta` in milliseconds since the Unix epoch,
+/// or `None` when the platform does not report one or it lies before the
+/// epoch, which the checks treat as unreadable.
+#[must_use]
+pub fn metadata_mtime_ms(meta: &fs::Metadata) -> Option<u64> {
+    let millis = meta
         .modified()
         .ok()?
         .duration_since(UNIX_EPOCH)
         .ok()?
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64;
-    let baseline = checked_at.unwrap_or(0);
-    let is_modified = mtime_ms.saturating_sub(baseline) > 100;
-    Some((is_modified, meta.len()))
+        .as_millis();
+    Some(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
 /// Streams the file through the hasher in 64 KiB chunks and compares

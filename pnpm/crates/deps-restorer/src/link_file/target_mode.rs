@@ -1,8 +1,6 @@
 //! The mode a file materialized into `node_modules` carries.
 
-#[cfg(unix)]
-use std::fs;
-use std::{io, path::Path};
+use std::{fs, io, path::Path};
 
 /// The permissions the copy tier gives a copy of `source_file`: the
 /// store-entry mode for a store entry, or the source's own permissions.
@@ -77,6 +75,19 @@ pub(super) fn file_mode(path: &Path) -> io::Result<u32> {
 #[cfg(target_os = "wasi")]
 pub(super) fn file_mode(path: &Path) -> io::Result<u32> {
     pnpm_fs::copy_permissions(path)
+}
+
+/// [`file_mode`] of `path`, read from its `meta` where the platform
+/// reports the mode there.
+#[cfg(unix)]
+pub(super) fn metadata_mode(meta: &fs::Metadata, _path: &Path) -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(meta.mode())
+}
+
+#[cfg(not(unix))]
+pub(super) fn metadata_mode(_meta: &fs::Metadata, path: &Path) -> io::Result<u32> {
+    file_mode(path)
 }
 
 /// Align a materialized `target_link` with the mode a fresh store write

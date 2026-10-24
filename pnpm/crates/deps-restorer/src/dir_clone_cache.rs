@@ -50,6 +50,7 @@ use crate::{
 use pnpm_config::{Config, NodeLinker, PackageImportMethod};
 use pnpm_lockfile::{PackageKey, PackageMetadata, SnapshotEntry};
 use pnpm_reporter::Reporter;
+use pnpm_store_dir::StoreFilesCheck;
 use std::{
     collections::HashMap,
     fs, io,
@@ -189,6 +190,7 @@ impl<'install> DirCloneCache<'install> {
         package_key: &PackageKey,
         save_path: &Path,
         cas_paths: &HashMap<String, PathBuf>,
+        files_check: Option<&StoreFilesCheck<'_>>,
     ) -> bool {
         if self.disabled.load(Ordering::Relaxed) {
             return false;
@@ -219,6 +221,7 @@ impl<'install> DirCloneCache<'install> {
             package_key,
             &canonical,
             cas_paths,
+            files_check,
         ) {
             return false;
         }
@@ -248,6 +251,7 @@ impl<'install> DirCloneCache<'install> {
         package_key: &PackageKey,
         canonical: &Path,
         cas_paths: &HashMap<String, PathBuf>,
+        files_check: Option<&StoreFilesCheck<'_>>,
     ) -> bool {
         if self.frozen_store {
             return marker_present(canonical, cas_paths);
@@ -257,7 +261,11 @@ impl<'install> DirCloneCache<'install> {
             import_method,
             canonical,
             cas_paths,
-            ImportIndexedDirOpts { safe_to_skip: true, ..ImportIndexedDirOpts::default() },
+            ImportIndexedDirOpts {
+                safe_to_skip: true,
+                files_check,
+                ..ImportIndexedDirOpts::default()
+            },
         ) else {
             return true;
         };

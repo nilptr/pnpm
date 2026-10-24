@@ -1,5 +1,5 @@
 use super::{
-    VerifiedFileIntegrity, VerifiedFilesCache, build_file_maps_from_index,
+    StoreFilesCheck, VerifiedFileIntegrity, VerifiedFilesCache, build_file_maps_from_index,
     check_pkg_files_integrity, defer_pkg_files_integrity, package_dir_matches_index,
 };
 use crate::{CafsFileInfo, PackageFilesIndex, SideEffectsDiff, StoreDir};
@@ -967,4 +967,144 @@ fn a_large_row_checks_every_file_and_caches_the_ones_that_pass() {
     let (_, pending) = defer_pkg_files_integrity(&store_dir, entry);
     assert!(!pending.verify(&store_dir, &cache), "the missing file fails the row");
     assert_eq!(cache.len(), 39, "every present file was checked and cached");
+}
+
+#[test]
+fn an_import_check_finds_a_recorded_file_by_its_store_path() {
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    let content = b"import";
+    let digest = sha512_hex(content);
+    let plain = plant_cafs_file(&store_dir, &digest, 0o644, content);
+    let exec = plant_cafs_file(&store_dir, &digest, 0o755, content);
+    let entry = index_with(
+        "sha512",
+        vec![
+            ("index.js", info(&digest, 6, 0o644, None)),
+            ("bin.sh", info(&digest, 6, 0o755, None)),
+        ],
+    );
+    let (_, pending) = defer_pkg_files_integrity(&store_dir, entry);
+    let cache = VerifiedFilesCache::new();
+    let check = StoreFilesCheck::new(&pending, &cache);
+
+    assert_eq!(check.file(&plain).map(|file| file.size()), Some(6));
+    assert_eq!(check.file(&exec).map(|file| file.size()), Some(6));
+    let other_shard = plain
+        .parent()
+        .unwrap()
+        .with_file_name("zz")
+        .join(plain.file_name().unwrap());
+    assert!(check.file(&other_shard).is_none(), "the shard is part of the digest");
+    assert!(
+        check
+            .file(&tmp.path().join("project/index.js"))
+            .is_none()
+    );
+}
+
+#[test]
+fn an_import_check_passes_an_unmodified_file_without_reading_it() {
+    let _guard = TALLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    // Not the content's digest: a check that read the file would fail.
+    let digest = sha512_hex(b"other");
+    let path = plant_cafs_file(&store_dir, &digest, 0o644, b"content");
+    let checked_at = now_ms();
+    let entry = index_with("sha512", vec![("index.js", info(&digest, 7, 0o644, Some(checked_at)))]);
+    let (_, pending) = defer_pkg_files_integrity(&store_dir, entry);
+    let cache = VerifiedFilesCache::new();
+    let check = StoreFilesCheck::new(&pending, &cache);
+    let before = VerifiedFileIntegrity::snapshot();
+
+    assert!(
+        check
+            .file(&path)
+            .unwrap()
+            .passes(&path, checked_at)
+    );
+
+    assert_eq!(VerifiedFileIntegrity::snapshot(), before, "nothing was hashed");
+    assert!(cache.is_empty(), "a file passed on its mtime is not cached");
+}
+
+#[test]
+fn an_import_check_hashes_a_file_modified_after_its_check() {
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    let content = b"modified";
+    let intact = plant_cafs_file(&store_dir, &sha512_hex(content), 0o644, content);
+    let corrupt = plant_cafs_file(&store_dir, &sha512_hex(b"original"), 0o644, content);
+    let checked_at = Some(now_ms() - 10_000);
+    let entry = index_with(
+        "sha512",
+        vec![
+            ("intact.js", info(&sha512_hex(content), 8, 0o644, checked_at)),
+            ("corrupt.js", info(&sha512_hex(b"original"), 8, 0o644, checked_at)),
+        ],
+    );
+    let (_, pending) = defer_pkg_files_integrity(&store_dir, entry);
+    let cache = VerifiedFilesCache::new();
+    let check = StoreFilesCheck::new(&pending, &cache);
+
+    assert!(
+        check
+            .file(&intact)
+            .unwrap()
+            .passes(&intact, now_ms())
+    );
+    assert!(cache.contains(&intact), "a file that hashed correctly is cached");
+    assert!(
+        !check
+            .file(&corrupt)
+            .unwrap()
+            .passes(&corrupt, now_ms())
+    );
+    assert!(!cache.contains(&corrupt));
+    assert!(
+        !check
+            .file(&corrupt)
+            .unwrap()
+            .passes_at(&corrupt)
+    );
+    fs::remove_file(&intact).unwrap();
+    assert!(
+        check
+            .file(&intact)
+            .unwrap()
+            .passes(&intact, now_ms()),
+        "the cache is trusted"
+    );
+}
+
+#[test]
+fn stale_file_names_a_recorded_file_that_fails_by_its_path() {
+    let tmp = tempdir().unwrap();
+    let store_dir = StoreDir::new(tmp.path());
+    let content = b"stale";
+    let digest = sha512_hex(content);
+    let present = plant_cafs_file(&store_dir, &digest, 0o644, content);
+    let missing = store_dir.cas_file_path_by_mode(&digest, 0o755).unwrap();
+    let entry = index_with(
+        "sha512",
+        vec![
+            ("index.js", info(&digest, 5, 0o644, None)),
+            ("bin.sh", info(&digest, 5, 0o755, None)),
+        ],
+    );
+    let (_, pending) = defer_pkg_files_integrity(&store_dir, entry);
+    let cache = VerifiedFilesCache::new();
+    let check = StoreFilesCheck::new(&pending, &cache);
+    let mut cas_paths = HashMap::from([
+        ("index.js".to_string(), present.clone()),
+        ("bin.sh".to_string(), missing.clone()),
+        ("local.js".to_string(), tmp.path().join("project/local.js")),
+    ]);
+
+    assert_eq!(check.stale_file(&cas_paths), Some(missing.as_path()));
+    assert!(cache.contains(&present), "every file is checked");
+
+    cas_paths.remove("bin.sh");
+    assert_eq!(check.stale_file(&cas_paths), None, "an unrecorded file passes");
 }

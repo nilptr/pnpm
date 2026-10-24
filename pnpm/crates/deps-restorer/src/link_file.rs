@@ -7,6 +7,7 @@ use pnpm_fs::{FsReflink, Host, is_cross_device};
 use pnpm_reporter::{
     LogEvent, LogLevel, PackageImportMethod as WireImportMethod, PackageImportMethodLog, Reporter,
 };
+use pnpm_store_dir::{StoreFileCheck, metadata_mtime_ms};
 use std::{
     fs, io,
     marker::PhantomData,
@@ -35,6 +36,42 @@ pub enum LinkFileError {
         #[error(source)]
         error: io::Error,
     },
+    /// The store file failed the [`StoreFileCheck`] the import was given,
+    /// or is missing. Nothing of it is left at the target. Only an import
+    /// with a check returns this; the caller fetches the package again.
+    #[display("store file {from:?} failed its integrity check")]
+    StaleStoreFile { from: PathBuf },
+}
+
+/// Payload of the `io::Error` a [`FileImport`] call returns when the
+/// store file fails its [`StoreFileCheck`]. [`import_fresh`] turns it
+/// into [`LinkFileError::StaleStoreFile`].
+#[derive(Debug, Display, Error)]
+#[display("the store file failed its integrity check")]
+struct StaleStoreFile;
+
+fn stale_store_file() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, StaleStoreFile)
+}
+
+fn is_stale_store_file(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(<dyn std::error::Error + Send + Sync>::is::<StaleStoreFile>)
+}
+
+/// `Err` when the inode an import placed or is about to copy, last
+/// modified at `mtime_ms`, fails `check`. An inode whose time cannot be
+/// read fails, as it does in [`StoreFileCheck::passes_at`].
+fn verify_store_file(
+    check: Option<StoreFileCheck<'_>>,
+    source_path: &Path,
+    mtime_ms: Option<u64>,
+) -> io::Result<()> {
+    match check {
+        Some(check) if !mtime_ms.is_some_and(|mtime_ms| check.passes(source_path, mtime_ms)) => {
+            Err(stale_store_file())
+        }
+        _ => Ok(()),
+    }
 }
 
 // npm keeps process-global fallback tiers in `try_import`. Python keeps an
@@ -225,6 +262,18 @@ pub fn import_into_fresh_target<Reporter: self::Reporter>(
     source_file: &Path,
     target_link: &Path,
 ) -> Result<(), LinkFileError> {
+    import_checked_into_fresh_target::<Reporter>(logged, method, source_file, target_link, None)
+}
+
+/// [`import_into_fresh_target`], checking `source_file` against `check`
+/// as it is imported.
+pub(crate) fn import_checked_into_fresh_target<Reporter: self::Reporter>(
+    logged: &AtomicU8,
+    method: PackageImportMethod,
+    source_file: &Path,
+    target_link: &Path,
+    check: Option<StoreFileCheck<'_>>,
+) -> Result<(), LinkFileError> {
     // Hardlinking a file from the store into `node_modules` means any
     // package that edits its own files at runtime (postinstall scripts
     // are the usual offender) ends up mutating the shared store copy.
@@ -234,7 +283,7 @@ pub fn import_into_fresh_target<Reporter: self::Reporter>(
     import_fresh::<Reporter, _>(
         logged,
         method,
-        &PathImport::<Host>::new(source_file, target_link),
+        &PathImport::<Host>::new(source_file, target_link).with_check(check),
         source_file,
         || target_link.to_path_buf(),
     )
@@ -249,9 +298,11 @@ pub(crate) fn import_fresh<Reporter: self::Reporter, Import: FileImport>(
     source_file: &Path,
     target_link: impl FnOnce() -> PathBuf,
 ) -> Result<(), LinkFileError> {
-    try_import::<Reporter, _>(method, logged, import)
-        .map(|_| ())
-        .or_else(|error| recover_from_concurrent_import(error, source_file, &target_link()))
+    let Err(error) = try_import::<Reporter, _>(method, logged, import) else { return Ok(()) };
+    if is_stale_store_file(&error) {
+        return Err(LinkFileError::StaleStoreFile { from: source_file.to_path_buf() });
+    }
+    recover_from_concurrent_import(error, import, source_file, &target_link())
 }
 
 /// Resolve an import syscall failure against a target the caller
@@ -295,8 +346,13 @@ fn replace_shared_inode_with_copy(source_file: &Path, target_link: &Path) -> io:
     )
 }
 
+/// A store file the import checks is verified before its placed copy
+/// is adopted, and a missing one fails that check the way a modified one
+/// does, so both reach the caller's re-fetch instead of failing the
+/// install.
 fn recover_from_concurrent_import(
     error: io::Error,
+    import: &impl FileImport,
     source_file: &Path,
     target_link: &Path,
 ) -> Result<(), LinkFileError> {
@@ -305,11 +361,19 @@ fn recover_from_concurrent_import(
         to: target_link.to_path_buf(),
         error,
     };
+    let stale = || LinkFileError::StaleStoreFile { from: source_file.to_path_buf() };
     if !is_placed_concurrently(&error, source_file, target_link) {
+        if error.kind() == io::ErrorKind::NotFound && import.source_is_stale() {
+            return Err(stale());
+        }
         return Err(import_error(error));
     }
     if fs::symlink_metadata(target_link).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Ok(());
+    }
+    if import.source_is_stale() {
+        import.remove_target().map_err(import_error)?;
+        return Err(stale());
     }
     if same_inode(source_file, target_link) {
         if source_has_desired_mode(source_file).map_err(import_error)? {
@@ -529,6 +593,9 @@ fn is_too_many_links(err: &io::Error) -> bool {
 /// All other errors allow fallback, including Windows's `ERROR_INVALID_FUNCTION`
 /// (`InvalidInput`) when NTFS rejects `FSCTL_DUPLICATE_EXTENTS_TO_FILE`.
 fn is_call_error(err: &io::Error) -> bool {
+    if is_stale_store_file(err) {
+        return true;
+    }
     match err.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::AlreadyExists => true,
         io::ErrorKind::PermissionDenied => !is_link_permission_error(err),
@@ -662,21 +729,42 @@ pub(crate) trait FileImport {
     fn align_target_mode(&self) -> io::Result<()>;
     /// Whether the inode a hard link just placed has a mode that may stay
     /// linked (see [`pnpm_fs::file_mode::store_inode_mode_is_linkable`]).
+    /// An import with a [`StoreFileCheck`] checks the inode here, where
+    /// its metadata is read anyway, and unlinks a target that fails.
     fn linked_mode_is_linkable(&self) -> io::Result<bool>;
     /// Unlink the target.
     fn remove_target(&self) -> io::Result<()>;
+    /// Whether the source fails the import's [`StoreFileCheck`] by its
+    /// own metadata, read here; `false` for an import without a check.
+    /// Asked about a target another writer placed, and about a source
+    /// that is missing.
+    fn source_is_stale(&self) -> bool;
 }
 
 /// [`FileImport`] between two paths, linking through `Sys`.
 pub(crate) struct PathImport<'a, Sys> {
     source: &'a Path,
     target: &'a Path,
+    check: Option<StoreFileCheck<'a>>,
     sys: PhantomData<Sys>,
 }
 
 impl<'a, Sys> PathImport<'a, Sys> {
     pub(crate) fn new(source: &'a Path, target: &'a Path) -> Self {
-        PathImport { source, target, sys: PhantomData }
+        PathImport { source, target, check: None, sys: PhantomData }
+    }
+
+    pub(crate) fn with_check(self, check: Option<StoreFileCheck<'a>>) -> Self {
+        PathImport { check, ..self }
+    }
+
+    /// The copy and reflink tiers cannot read the source's metadata from
+    /// the handle they copy through, so they check it by its path first.
+    fn verify_source(&self) -> io::Result<()> {
+        match self.check {
+            Some(check) if !check.passes_at(self.source) => Err(stale_store_file()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -686,10 +774,12 @@ impl<Sys: FsHardLink + FsReflink> FileImport for PathImport<'_, Sys> {
     }
 
     fn reflink(&self) -> io::Result<()> {
+        self.verify_source()?;
         Sys::reflink(self.source, self.target)
     }
 
     fn copy(&self) -> io::Result<()> {
+        self.verify_source()?;
         copy_file(self.source, self.target)
     }
 
@@ -698,11 +788,23 @@ impl<Sys: FsHardLink + FsReflink> FileImport for PathImport<'_, Sys> {
     }
 
     fn linked_mode_is_linkable(&self) -> io::Result<bool> {
-        mode_is_linkable(self.source, || target_mode::file_mode(self.target))
+        if self.check.is_none() {
+            return mode_is_linkable(self.source, || target_mode::file_mode(self.target));
+        }
+        let meta = fs::symlink_metadata(self.target)?;
+        if let Err(error) = verify_store_file(self.check, self.source, metadata_mtime_ms(&meta)) {
+            self.remove_target()?;
+            return Err(error);
+        }
+        mode_is_linkable(self.source, || target_mode::metadata_mode(&meta, self.target))
     }
 
     fn remove_target(&self) -> io::Result<()> {
         fs::remove_file(self.target)
+    }
+
+    fn source_is_stale(&self) -> bool {
+        self.verify_source().is_err()
     }
 }
 
@@ -713,3 +815,5 @@ mod target_mode;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{RecordedStoreFiles, now_ms};

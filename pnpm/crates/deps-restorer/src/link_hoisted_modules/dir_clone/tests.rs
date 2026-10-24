@@ -157,7 +157,8 @@ fn local_tarball_imports_updated_content_despite_an_existing_canonical() {
         PackageImportMethod::Clone,
         &key,
         &first,
-        &HashMap::from([("index.js".to_string(), original)])
+        &HashMap::from([("index.js".to_string(), original)]),
+        None,
     ));
     let flags = HashMap::from([(key, false)]);
     let cache = HoistedDirCloneCache::new(Some(&cache), Some(&packages), None, Some(&flags), false)

@@ -9,9 +9,10 @@ use super::{
 };
 use crate::{CasPathsByPkgId, InstallPackageBySnapshotError};
 use pnpm_git_fetcher::{GitFetcherError, resolve_package_build_permission};
-use pnpm_lockfile::{LockfileResolution, PackageKey, PackageMetadata, PkgName};
+use pnpm_lockfile::{LockfileResolution, PackageKey, PackageMetadata, PkgName, SnapshotEntry};
 use pnpm_package_manifest::parse_manifest;
 use pnpm_reporter::Reporter;
+use pnpm_store_dir::{PendingFilesCheck, StoreFilesCheck, VerifiedFilesCache};
 use pnpm_tarball::PrefetchResult;
 use std::{
     borrow::Cow,
@@ -164,6 +165,10 @@ pub(super) struct WarmLinkBatch<'a> {
     pub(super) needs_build_marker_source: Option<&'a Path>,
     pub(super) removed_aliases_by_key: &'a HashMap<PackageKey, Vec<PkgName>>,
     pub(super) template: &'a LinkSlotsParallel<'a>,
+    /// The files checks the prefetch deferred, by store-index row key.
+    /// A warm slot whose row has one runs it as it imports.
+    pub(super) files_checks: &'a HashMap<String, PendingFilesCheck>,
+    pub(super) verified_files_cache: &'a VerifiedFilesCache,
 }
 /// Link every warm slot. Hoisted skips the batch entirely: no virtual-store
 /// slot gets written, so there's no per-snapshot link work to do — the CAS
@@ -171,17 +176,29 @@ pub(super) struct WarmLinkBatch<'a> {
 /// and all link work is routed into the hoisted linker instead. It still wants
 /// the progress reporter to fire so `pnpm:progress imported`-style updates
 /// render the warm hits.
-pub(super) fn link_warm_batch<Reporter: self::Reporter>(
-    warm: &[partition::WarmEntry<'_>],
+///
+/// Returns the warm snapshots whose import found a store file stale. They
+/// are not linked; the caller fetches them again.
+pub(super) fn link_warm_batch<'a, Reporter: self::Reporter>(
+    warm: &[partition::WarmEntry<'a>],
     batch: &WarmLinkBatch<'_>,
-) -> Result<(), CreateVirtualStoreError> {
+) -> Result<Vec<(&'a PackageKey, &'a SnapshotEntry)>, CreateVirtualStoreError> {
     if batch.is_hoisted {
         emit_hoisted_warm_progress::<Reporter>(warm, batch);
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let files_checks: Vec<Option<StoreFilesCheck<'_>>> = warm
+        .iter()
+        .map(|(_, _, _, cache_key, _)| {
+            batch.files_checks
+                .get(*cache_key)
+                .map(|files| StoreFilesCheck::new(files, batch.verified_files_cache))
+        })
+        .collect();
     let warm_slots: Vec<SlotLink<'_>> = warm
         .iter()
-        .map(|(snapshot_key, snapshot, cas_paths, cache_key, needs_build_marker)| {
+        .zip(&files_checks)
+        .map(|((snapshot_key, snapshot, cas_paths, cache_key, needs_build_marker), files_check)| {
             let force_import = batch.reuse.must_replace(snapshot_key);
             SlotLink {
                 source: crate::SlotImportSource {
@@ -196,6 +213,7 @@ pub(super) fn link_warm_batch<Reporter: self::Reporter>(
                 snapshot_key,
                 snapshot,
                 cas_paths: cas_paths.as_ref(),
+                files_check: files_check.as_ref(),
                 warm_cache_key: Some(cache_key),
                 // A cache key means the file map is CAS-backed, and
                 // `snapshot_cache_key` yields none for a directory resolution,
@@ -211,11 +229,17 @@ pub(super) fn link_warm_batch<Reporter: self::Reporter>(
             }
         })
         .collect();
-    link_slots_parallel::<Reporter>(LinkSlotsParallel {
+    let stale = link_slots_parallel::<Reporter>(LinkSlotsParallel {
         batch: "warm",
         slots: &warm_slots,
         ..*batch.template
-    })
+    })?;
+    let stale: HashSet<&PackageKey> = stale.iter().collect();
+    Ok(warm
+        .iter()
+        .filter(|(snapshot_key, ..)| stale.contains(snapshot_key))
+        .map(|(snapshot_key, snapshot, ..)| (*snapshot_key, *snapshot))
+        .collect())
 }
 pub(super) fn emit_hoisted_warm_progress<Reporter: self::Reporter>(
     warm: &[partition::WarmEntry<'_>],

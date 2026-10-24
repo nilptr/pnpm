@@ -128,6 +128,7 @@ mod macos {
                 &key,
                 &first_target,
                 &cas_paths,
+                None,
             ),
             "first import must be served by populating and cloning the canonical slot",
         );
@@ -167,6 +168,7 @@ mod macos {
                 &key,
                 &second_target,
                 &cas_paths,
+                None,
             ),
             "warm import must be served from the canonical slot alone",
         );
@@ -198,6 +200,7 @@ mod macos {
             &key,
             &target,
             &HashMap::new(),
+            None,
         ));
     }
 
@@ -223,6 +226,7 @@ mod macos {
             &other,
             &target,
             &HashMap::new(),
+            None,
         ));
     }
 

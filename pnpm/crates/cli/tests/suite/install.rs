@@ -898,6 +898,63 @@ fn force_install_repairs_tampered_store_blob_in_place() {
     drop((root, mock_instance));
 }
 
+/// A fresh `node_modules` imports every package from the store again. A
+/// blob tampered with since its last check fails that check as it is
+/// linked, so the package is fetched again before anything of it is
+/// linked, and the fetch repairs the blob in place as in the test above.
+#[cfg(unix)]
+#[test]
+fn install_refetches_a_tampered_store_blob_before_linking_it() {
+    use std::os::unix::fs::MetadataExt;
+
+    let CommandTempCwd {
+        pacquet,
+        root,
+        workspace,
+        npmrc_info,
+        ..
+    } = CommandTempCwd::init().add_mocked_registry();
+    let AddMockedRegistry { mock_instance, .. } = npmrc_info;
+    fs::write(
+        workspace.join("package.json"),
+        serde_json::json!({ "dependencies": { "is-positive": "1.0.0" } }).to_string(),
+    )
+    .expect("write package.json");
+
+    pacquet
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_env("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", "hardlink")
+        .with_arg("install")
+        .assert()
+        .success();
+
+    let installed = workspace.join("node_modules/is-positive/index.js");
+    let pristine = fs::read(&installed).expect("read installed file");
+    let linked = workspace.join("linked-copy.js");
+    fs::hard_link(&installed, &linked).expect("hard link the store blob");
+    let inode_before = fs::metadata(&linked).unwrap().ino();
+    fs::write(&installed, b"tampered").expect("tamper through the hard link");
+    bump_mtime(&installed);
+    fs::remove_dir_all(workspace.join("node_modules")).expect("remove node_modules");
+
+    pacquet_in(&workspace)
+        .with_env("PNPM_CONFIG_REGISTRY", mock_instance.url())
+        .with_env("PNPM_CONFIG_PACKAGE_IMPORT_METHOD", "hardlink")
+        .with_arg("install")
+        .assert()
+        .success();
+
+    assert_eq!(fs::read(&installed).unwrap(), pristine);
+    assert_eq!(fs::read(&linked).unwrap(), pristine, "hard-linked copy must be healed");
+    assert_eq!(
+        fs::metadata(&installed).unwrap().ino(),
+        inode_before,
+        "the reinstalled file must link to the store blob's original inode",
+    );
+
+    drop((root, mock_instance));
+}
+
 /// Trust/policy settings key the lockfile-verification gate, which is
 /// why pnpm records `trustPolicy*` in the workspace state.
 #[test]

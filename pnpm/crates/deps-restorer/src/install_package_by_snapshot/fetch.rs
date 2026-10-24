@@ -371,6 +371,8 @@ impl InstallPackageBySnapshot<'_> {
             },
             layout: self.ctx.linker.layout,
             cas_paths,
+            // A fetched row was checked by the fetch, or written by it.
+            files_check: None,
 
             package_id: slot.package_id,
 

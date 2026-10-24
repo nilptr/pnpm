@@ -91,6 +91,7 @@ pub type StoreIndexKeysBySnapshot = HashMap<PackageKey, String>;
 pub type RequiresBuildBySnapshot = HashMap<PackageKey, bool>;
 
 /// Store handles that a fresh resolution and dependency materialization share.
+#[derive(Clone, Copy)]
 pub struct CreateVirtualStoreStoreContext<'a> {
     pub index: Option<&'a SharedReadonlyStoreIndex>,
     pub verified_files_cache: &'a SharedVerifiedFilesCache,

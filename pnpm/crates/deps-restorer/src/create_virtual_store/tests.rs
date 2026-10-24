@@ -417,6 +417,7 @@ fn slot_link<'a>(
         snapshot_key,
         snapshot,
         cas_paths,
+        files_check: None,
         warm_cache_key: None,
 
         dir_clone_cacheable: false,

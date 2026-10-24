@@ -289,8 +289,12 @@ fn recover_from_concurrent_import_preserves_hardlink_with_desired_mode() {
     fs::set_permissions(&src, fs::Permissions::from_mode(desired)).unwrap();
     fs::hard_link(&src, &dst).unwrap();
 
-    let result =
-        recover_from_concurrent_import(io::Error::from(io::ErrorKind::AlreadyExists), &src, &dst);
+    let result = recover_from_concurrent_import(
+        io::Error::from(io::ErrorKind::AlreadyExists),
+        &PathImport::<Host>::new(&src, &dst),
+        &src,
+        &dst,
+    );
     result.expect("recover_from_concurrent_import should succeed");
 
     assert_eq!(super::inode(&src), super::inode(&dst), "hardlink is preserved when mode matches");
@@ -320,8 +324,12 @@ fn recover_from_concurrent_import_replaces_hardlink_with_mismatched_mode() {
     fs::hard_link(&src, &dst).unwrap();
     fs::set_permissions(&src, fs::Permissions::from_mode(mismatched)).unwrap();
 
-    let result =
-        recover_from_concurrent_import(io::Error::from(io::ErrorKind::AlreadyExists), &src, &dst);
+    let result = recover_from_concurrent_import(
+        io::Error::from(io::ErrorKind::AlreadyExists),
+        &PathImport::<Host>::new(&src, &dst),
+        &src,
+        &dst,
+    );
     result.expect("recover_from_concurrent_import should succeed");
 
     assert_ne!(
@@ -416,8 +424,13 @@ fn eexist_recovery_tolerates_a_target_its_writer_replaced() {
     let src = write_source(tmp.path(), STORE_EXEC_ENTRY, b"#!/usr/bin/env node\n");
     let dst = tmp.path().join("dst");
 
-    recover_from_concurrent_import(io::Error::from(io::ErrorKind::AlreadyExists), &src, &dst)
-        .expect("a target unlinked after EEXIST belongs to a writer that finishes it");
+    recover_from_concurrent_import(
+        io::Error::from(io::ErrorKind::AlreadyExists),
+        &PathImport::<Host>::new(&src, &dst),
+        &src,
+        &dst,
+    )
+    .expect("a target unlinked after EEXIST belongs to a writer that finishes it");
 }
 /// APFS `clonefile` can report a destination another importer renamed
 /// into place as `NotFound` (pnpm/pnpm#14560). With the dirent and the
@@ -434,8 +447,13 @@ fn spurious_not_found_with_an_existing_target_is_adopted() {
     let dst = write_source(tmp.path(), "dst", b"#!/usr/bin/env node\n");
     fs::set_permissions(&dst, fs::Permissions::from_mode(0o644)).unwrap();
 
-    recover_from_concurrent_import(io::Error::from(io::ErrorKind::NotFound), &src, &dst)
-        .expect("a NotFound against an existing target is a concurrent import");
+    recover_from_concurrent_import(
+        io::Error::from(io::ErrorKind::NotFound),
+        &PathImport::<Host>::new(&src, &dst),
+        &src,
+        &dst,
+    )
+    .expect("a NotFound against an existing target is a concurrent import");
 
     let expected = pnpm_fs::file_mode::store_entry_mode(true, pnpm_fs::file_mode::current_umask());
     let dst_mode = fs::metadata(&dst)
@@ -451,10 +469,16 @@ fn not_found_without_a_target_propagates() {
     let src = write_source(tmp.path(), STORE_ENTRY, b"data\n");
     let dst = tmp.path().join("dst");
 
-    let error =
-        recover_from_concurrent_import(io::Error::from(io::ErrorKind::NotFound), &src, &dst)
-            .expect_err("a NotFound with no target dirent is a real failure");
-    let LinkFileError::Import { from, to, error } = error;
+    let error = recover_from_concurrent_import(
+        io::Error::from(io::ErrorKind::NotFound),
+        &PathImport::<Host>::new(&src, &dst),
+        &src,
+        &dst,
+    )
+    .expect_err("a NotFound with no target dirent is a real failure");
+    let LinkFileError::Import { from, to, error } = error else {
+        panic!("expected an import error")
+    };
     assert_eq!((from, to), (src, dst));
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
 }
@@ -464,10 +488,14 @@ fn not_found_without_a_source_propagates() {
     let src = tmp.path().join("missing-blob");
     let dst = write_source(tmp.path(), "dst", b"data\n");
 
-    let error =
-        recover_from_concurrent_import(io::Error::from(io::ErrorKind::NotFound), &src, &dst)
-            .expect_err("a NotFound for a missing source is a real failure");
-    let LinkFileError::Import { error, .. } = error;
+    let error = recover_from_concurrent_import(
+        io::Error::from(io::ErrorKind::NotFound),
+        &PathImport::<Host>::new(&src, &dst),
+        &src,
+        &dst,
+    )
+    .expect_err("a NotFound for a missing source is a real failure");
+    let LinkFileError::Import { error, .. } = error else { panic!("expected an import error") };
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
 }
 #[test]
@@ -478,11 +506,12 @@ fn other_import_errors_propagate() {
 
     let error = recover_from_concurrent_import(
         io::Error::from(io::ErrorKind::PermissionDenied),
+        &PathImport::<Host>::new(&src, &dst),
         &src,
         &dst,
     )
     .expect_err("PermissionDenied is not a concurrent import");
-    let LinkFileError::Import { error, .. } = error;
+    let LinkFileError::Import { error, .. } = error else { panic!("expected an import error") };
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 }
 /// `Auto` must succeed on any filesystem because it falls through to

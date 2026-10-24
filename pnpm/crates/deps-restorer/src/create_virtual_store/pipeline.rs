@@ -16,11 +16,8 @@ use pnpm_lockfile::{
     LockfileEntries, PackageKey, PackageMetadata, PlatformSelector, SnapshotEntry,
 };
 use pnpm_reporter::{LogEvent, LogLevel, Reporter, StatsLog, StatsMessage};
-use pnpm_tarball::PrefetchResult;
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use pnpm_tarball::{PrefetchResult, PrefetchedCasPaths};
+use std::collections::{HashMap, HashSet};
 
 impl<'a> CreateVirtualStore<'a> {
     /// Execute the subroutine. Returns the set of bundled manifests
@@ -154,20 +151,13 @@ impl<'a> CreateVirtualStore<'a> {
         );
 
         let links = self.link_plan(&plan);
+        let inputs = ColdInputs { wanted, store, prefetched, marker_source, links: &links };
+        let refetch = self.link_warm::<Reporter>(&inputs, &partition)?;
+        partition.refetch_instead_of_warm(refetch);
         let mut indexes =
             CasIndexes::warm(links.shared_packages.as_ref(), &partition.warm, self.is_hoisted());
-        self.link_warm::<Reporter>(
-            wanted,
-            &partition,
-            &links,
-            marker_source.map(tempfile::NamedTempFile::path),
-        )?;
-        let fetch_failed = self.download_cold::<Reporter>(
-            ColdInputs { wanted, store, prefetched, marker_source, links: &links },
-            &mut partition,
-            &mut indexes,
-        )
-        .await?;
+        let fetch_failed =
+            self.download_cold::<Reporter>(inputs, &mut partition, &mut indexes).await?;
         self.apply_side_effects(wanted, &mut partition, &indexes.shared_base).await;
 
         // The writer is owned by the caller now. They drop their
@@ -187,7 +177,7 @@ impl<'a> CreateVirtualStore<'a> {
         })
     }
 
-    fn is_hoisted(&self) -> bool {
+    pub(super) fn is_hoisted(&self) -> bool {
         matches!(self.ctx.linker.kind, NodeLinker::Hoisted)
     }
 
@@ -308,21 +298,23 @@ impl<'a> CreateVirtualStore<'a> {
         }
     }
 
-    fn link_warm<Reporter: self::Reporter>(
+    /// Link the warm slots, returning the ones to fetch again (see
+    /// [`partition::Partition::refetch`]).
+    fn link_warm<'p, Reporter: self::Reporter>(
         &self,
-        wanted: WantedEntries<'a>,
-        partition: &partition::Partition<'_>,
-        links: &LinkPlan<'_>,
-        marker_source: Option<&Path>,
-    ) -> Result<(), CreateVirtualStoreError> {
+        inputs: &ColdInputs<'_, 'a>,
+        partition: &partition::Partition<'p>,
+    ) -> Result<Vec<(&'p PackageKey, &'p SnapshotEntry)>, CreateVirtualStoreError> {
         link_warm_batch::<Reporter>(
             &partition.warm,
             &WarmLinkBatch {
-                reuse: self.slot_reuse(wanted.packages),
+                reuse: self.slot_reuse(inputs.wanted.packages),
                 is_hoisted: self.is_hoisted(),
-                needs_build_marker_source: marker_source,
-                removed_aliases_by_key: &links.removed_aliases_by_key,
-                template: &links.template,
+                needs_build_marker_source: inputs.marker_source.map(tempfile::NamedTempFile::path),
+                removed_aliases_by_key: &inputs.links.removed_aliases_by_key,
+                template: &inputs.links.template,
+                files_checks: &inputs.prefetched.pending_checks,
+                verified_files_cache: inputs.store.verified_files_cache,
             },
         )
     }
@@ -346,21 +338,29 @@ impl<'a> CreateVirtualStore<'a> {
             runtime_platform_selector(self.selection.supported_architectures);
         let mut fetch_failed = HashSet::new();
         let mut cold_cas_paths = Vec::new();
+        let mut state = ColdBatchState {
+            fetch_failed: &mut fetch_failed,
+            requires_build_by_snapshot: &mut partition.requires_build_by_snapshot,
+            shared_base_cas_paths: &mut indexes.shared_base,
+        };
+        let batch = |cold, prefetched| ColdBatch {
+            cold,
+            installer: self.cold_installer(&inputs, &runtime_platform_selector, prefetched),
+            reuse: self.slot_reuse(inputs.wanted.packages),
+            marker_source: inputs.marker_source,
+            removed_aliases_by_key: &inputs.links.removed_aliases_by_key,
+            link_template: &inputs.links.template,
+            shared_packages: inputs.links.shared_packages.as_ref(),
+        };
         run_cold_batch::<Reporter>(
-            ColdBatch {
-                cold: &partition.cold,
-                installer: self.cold_installer(&inputs, &runtime_platform_selector),
-                reuse: self.slot_reuse(inputs.wanted.packages),
-                marker_source: inputs.marker_source,
-                removed_aliases_by_key: &inputs.links.removed_aliases_by_key,
-                link_template: &inputs.links.template,
-                shared_packages: inputs.links.shared_packages.as_ref(),
-            },
-            &mut ColdBatchState {
-                fetch_failed: &mut fetch_failed,
-                requires_build_by_snapshot: &mut partition.requires_build_by_snapshot,
-                shared_base_cas_paths: &mut indexes.shared_base,
-            },
+            batch(&partition.cold, Some(&inputs.prefetched.cas_paths)),
+            &mut state,
+            &mut cold_cas_paths,
+        )
+        .await?;
+        run_cold_batch::<Reporter>(
+            batch(&partition.refetch, None),
+            &mut state,
             &mut cold_cas_paths,
         )
         .await?;
@@ -374,13 +374,14 @@ impl<'a> CreateVirtualStore<'a> {
         &'i self,
         inputs: &'i ColdInputs<'_, 'a>,
         runtime_platform_selector: &'i PlatformSelector,
+        prefetched_cas_paths: Option<&'i PrefetchedCasPaths>,
     ) -> InstallPackageBySnapshot<'i> {
         InstallPackageBySnapshot {
             fetching: crate::SnapshotFetchContext {
                 http_client: self.fetching.http_client,
                 store_index: inputs.store.index,
                 store_index_writer: Some(self.fetching.store_index_writer),
-                prefetched_cas_paths: Some(&inputs.prefetched.cas_paths),
+                prefetched_cas_paths,
                 tarball_mem_cache: self.fetching.tarball_mem_cache,
                 progress_reported: Some(self.fetching.progress_reported),
                 verified_files_cache: inputs.store.verified_files_cache,

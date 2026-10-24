@@ -100,5 +100,13 @@ impl<'a> AtPath<'a> {
     }
 }
 
+/// The modification time of `stat` in milliseconds since the Unix
+/// epoch, clamped to `u64`: a time before the epoch reads as zero.
+#[must_use]
+pub fn stat_mtime_ms(stat: &Stat) -> u64 {
+    let millis = i128::from(stat.st_mtime) * 1000 + i128::from(stat.st_mtime_nsec) / 1_000_000;
+    u64::try_from(millis).unwrap_or(if millis < 0 { 0 } else { u64::MAX })
+}
+
 #[cfg(test)]
 mod tests;

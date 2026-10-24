@@ -1,5 +1,14 @@
-use super::{AtImport, AtPath, FileImport, StoreFilesDir};
+use super::{
+    super::{
+        LinkFileError, import_fresh, is_stale_store_file,
+        tests::{RecordedStoreFiles, now_ms},
+    },
+    AtImport, AtPath, FileImport, StoreFilesDir,
+};
+use pnpm_config::PackageImportMethod;
 use pnpm_fs::file_mode::{current_umask, store_entry_mode};
+use pnpm_reporter::SilentReporter;
+use pnpm_store_dir::StoreFileCheck;
 use std::{
     fs, io,
     os::{
@@ -7,6 +16,7 @@ use std::{
         unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    sync::atomic::AtomicU8,
 };
 use tempfile::{TempDir, tempdir};
 
@@ -37,15 +47,34 @@ impl Fixture {
     }
 
     fn import_of<'a>(&'a self, source_path: &'a Path) -> AtImport<'a> {
+        self.import_checked(source_path, None)
+    }
+
+    fn import_checked<'a>(
+        &'a self,
+        source_path: &'a Path,
+        check: Option<StoreFileCheck<'a>>,
+    ) -> AtImport<'a> {
         AtImport::new(
             source_path,
             StoreFilesDir::locate(self.store_files.as_ref(), source_path),
             AtPath::new(self.package_dir.as_fd(), Path::new("index.js")),
+            check,
         )
     }
 
     fn import(&self) -> AtImport<'_> {
         self.import_of(&self.source_path)
+    }
+
+    /// The row recording the store entry as checked at `checked_at`. The
+    /// entry's content is not what its digest says, so a check that
+    /// hashes it fails.
+    fn recorded(&self, checked_at: Option<u64>) -> RecordedStoreFiles {
+        RecordedStoreFiles::new(
+            &self.root.path().join("store"),
+            &[("index.js", &self.source_path, 7, checked_at)],
+        )
     }
 
     fn target(&self) -> PathBuf {
@@ -175,4 +204,72 @@ fn a_clone_is_aligned_with_the_desired_mode() {
     );
     assert_eq!(mode_of(&fixture.target()), desired_mode());
     assert_eq!(mode_of(&fixture.source_path), 0o600);
+}
+
+#[test]
+fn a_hard_link_to_a_store_file_checked_since_it_changed_passes_without_a_read() {
+    let fixture = Fixture::new();
+    fixture.set_source_mode(desired_mode());
+    let recorded = fixture.recorded(Some(now_ms()));
+    let files = recorded.check();
+    let import = fixture.import_checked(&fixture.source_path, files.file(&fixture.source_path));
+
+    import.hard_link().unwrap();
+
+    assert!(import.linked_mode_is_linkable().unwrap());
+    assert_eq!(fs::read_to_string(fixture.target()).unwrap(), "content");
+}
+
+#[test]
+fn a_stale_store_file_is_not_left_at_the_target_by_any_tier() {
+    let fixture = Fixture::new();
+    fixture.set_source_mode(desired_mode());
+    let recorded = fixture.recorded(Some(0));
+    let files = recorded.check();
+    let import = fixture.import_checked(&fixture.source_path, files.file(&fixture.source_path));
+
+    import.hard_link().unwrap();
+    assert!(is_stale_store_file(&import.linked_mode_is_linkable().unwrap_err()));
+    assert!(!fixture.target().exists(), "the stale link is removed");
+
+    assert!(is_stale_store_file(&import.copy().unwrap_err()));
+    assert!(!fixture.target().exists(), "nothing is copied from a stale source");
+
+    #[cfg(target_os = "macos")]
+    {
+        import.reflink().unwrap();
+        assert!(is_stale_store_file(&import.align_target_mode().unwrap_err()));
+        assert!(!fixture.target().exists(), "the stale clone is removed");
+    }
+}
+
+#[test]
+fn an_import_reports_a_stale_or_missing_store_file_for_the_caller_to_fetch_again() {
+    let fixture = Fixture::new();
+    let recorded = fixture.recorded(Some(0));
+    let files = recorded.check();
+    let import = fixture.import_checked(&fixture.source_path, files.file(&fixture.source_path));
+    let import_fresh = |import: &AtImport<'_>| {
+        import_fresh::<SilentReporter, _>(
+            &AtomicU8::new(0),
+            PackageImportMethod::Hardlink,
+            import,
+            &fixture.source_path,
+            || fixture.target(),
+        )
+    };
+
+    let error = import_fresh(&import).unwrap_err();
+    assert!(
+        matches!(&error, LinkFileError::StaleStoreFile { from } if *from == fixture.source_path)
+    );
+    assert!(!fixture.target().exists());
+
+    fs::remove_file(&fixture.source_path).unwrap();
+    let error = import_fresh(&import).unwrap_err();
+    assert!(matches!(error, LinkFileError::StaleStoreFile { .. }), "{error}");
+
+    let unchecked = fixture.import();
+    let error = import_fresh(&unchecked).unwrap_err();
+    assert!(matches!(error, LinkFileError::Import { .. }), "{error}");
 }

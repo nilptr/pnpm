@@ -181,6 +181,7 @@ async fn run_emits_imported_event_after_import_indexed_dir() {
         },
         layout: &layout,
         cas_paths: &cas_paths,
+        files_check: None,
 
         package_id: "react@18.0.0",
 
@@ -273,6 +274,7 @@ fn needs_build_slots_ignore_the_configured_import_method() {
             },
             layout: &layout,
             cas_paths: &HashMap::new(),
+            files_check: None,
 
             package_id: "react@18.0.0",
 
@@ -381,6 +383,7 @@ fn a_build_write_does_not_reach_the_import_source() {
         },
         layout: &layout,
         cas_paths: &cas_paths,
+        files_check: None,
 
         package_id: "lib@file+packages+lib",
 
@@ -446,6 +449,7 @@ fn run_imports_needs_build_marker_with_a_fresh_package() {
         },
         layout: &layout,
         cas_paths: &cas_paths,
+        files_check: None,
 
         package_id: "react@18.0.0",
 
@@ -503,6 +507,7 @@ fn force_import_replaces_an_existing_package_at_the_same_snapshot_key() {
         },
         layout: &layout,
         cas_paths: &HashMap::from([("index.js".to_string(), source)]),
+        files_check: None,
 
         package_id: "revision-pkg@1.0.0",
 
@@ -561,6 +566,7 @@ fn run_rejects_traversal_package_name() {
         },
         layout: &layout,
         cas_paths: &cas_paths,
+        files_check: None,
 
         package_id: "../../escaped@1.0.0",
 
@@ -652,6 +658,7 @@ fn run_rejects_uncontained_slot_before_creating_dirs() {
         },
         layout: &layout,
         cas_paths: &cas_paths,
+        files_check: None,
         package_id: "evil@1.0.0",
         dir_clone_cache: None,
         link_concurrency_probe: None,
@@ -740,6 +747,7 @@ async fn run_removes_obsolete_child_links() {
         },
         layout: &layout,
         cas_paths: &cas_paths,
+        files_check: None,
 
         package_id: "react@18.0.0",
 

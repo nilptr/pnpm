@@ -87,6 +87,7 @@ impl<'a> HoistedDirCloneCache<'a> {
             &key,
             &node.dir,
             cas_paths,
+            None,
         )
     }
 }

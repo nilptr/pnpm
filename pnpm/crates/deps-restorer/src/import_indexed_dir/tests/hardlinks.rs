@@ -10,6 +10,7 @@ const REUSE: ImportIndexedDirOpts = ImportIndexedDirOpts {
     keep_modules_dir: true,
     safe_to_skip: false,
     preserve_symlinks: true,
+    files_check: None,
 };
 
 #[test]

@@ -16,6 +16,7 @@ use pnpm_reporter::{
     LogEvent, LogLevel, PackageImportMethod as WireImportMethod, ProgressLog, ProgressMessage,
     Reporter,
 };
+use pnpm_store_dir::StoreFilesCheck;
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
@@ -43,6 +44,9 @@ pub struct CreateVirtualDirBySnapshot<'a> {
     /// [`crate::VirtualStoreLayout`] for how it's built.
     pub layout: &'a VirtualStoreLayout,
     pub cas_paths: &'a HashMap<String, PathBuf>,
+    /// The integrity check of `cas_paths`'s store files, run as they are
+    /// imported (see [`ImportIndexedDirOpts::files_check`]).
+    pub files_check: Option<&'a StoreFilesCheck<'a>>,
     /// Stable identifier for the package, e.g. `"{name}@{version}"`.
     /// Currently unused by `imported` (whose payload doesn't carry
     /// `packageId`) but kept here so future progress channels (e.g.
@@ -213,24 +217,26 @@ impl CreateVirtualDirBySnapshot<'_> {
                 self.dependencies.package_key,
                 save_path,
                 cas_paths,
+                self.files_check,
             )
         {
             return Ok(());
         }
+        let opts = slot_import_opts(
+            self.layout,
+            SlotForceInputs {
+                interrupted_build,
+                source_is_mutable: self.source.is_mutable,
+                source_exists: self.source.source_exists,
+                force_import: self.source.force,
+            },
+        );
         import_indexed_dir::<Reporter>(
             self.import.logged_methods,
             self.import_method(),
             save_path,
             cas_paths,
-            slot_import_opts(
-                self.layout,
-                SlotForceInputs {
-                    interrupted_build,
-                    source_is_mutable: self.source.is_mutable,
-                    source_exists: self.source.source_exists,
-                    force_import: self.source.force,
-                },
-            ),
+            ImportIndexedDirOpts { files_check: self.files_check, ..opts },
         )
         .map_err(CreateVirtualDirError::ImportIndexedDir)
     }
@@ -387,7 +393,7 @@ struct SlotForceInputs {
 fn slot_import_opts(
     layout: &crate::VirtualStoreLayout,
     slot: SlotForceInputs,
-) -> ImportIndexedDirOpts {
+) -> ImportIndexedDirOpts<'static> {
     let SlotForceInputs {
         interrupted_build,
         source_is_mutable,
@@ -409,6 +415,7 @@ fn slot_import_opts(
             keep_modules_dir: true,
             safe_to_skip,
             preserve_symlinks: source_is_mutable,
+            files_check: None,
         };
     }
     ImportIndexedDirOpts { safe_to_skip, ..ImportIndexedDirOpts::default() }

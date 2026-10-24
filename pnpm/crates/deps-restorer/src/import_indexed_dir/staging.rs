@@ -1,11 +1,12 @@
 use super::{
-    ImportIndexedDirError, Placement, PreserveModulesFailure, PreservedModules,
-    existing_dirent_kind, file_matches_store_entry, populate_dir,
+    ImportIndexedDirError, ImportIndexedDirOpts, Placement, PreserveModulesFailure,
+    PreservedModules, existing_dirent_kind, file_matches_store_entry, populate_dir,
 };
-use crate::import_into_fresh_target;
+use crate::link_file::import_checked_into_fresh_target;
 use pnpm_config::PackageImportMethod;
 use pnpm_fs::{FsRemoveDirent, FsRename, Host, rename_even_across_devices};
 use pnpm_reporter::Reporter;
+use pnpm_store_dir::StoreFileCheck;
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -28,11 +29,16 @@ pub(super) fn import_atomic<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     store_path: &Path,
     target: &Path,
+    check: Option<StoreFileCheck<'_>>,
 ) -> Result<(), ImportIndexedDirError> {
     let temp = pick_stage_path(target);
-    if let Err(error) =
-        import_into_fresh_target::<Reporter>(logged_methods, import_method, store_path, &temp)
-    {
+    if let Err(error) = import_checked_into_fresh_target::<Reporter>(
+        logged_methods,
+        import_method,
+        store_path,
+        &temp,
+        check,
+    ) {
         let _ = fs::remove_file(&temp);
         return Err(ImportIndexedDirError::LinkFile(error));
     }
@@ -53,9 +59,14 @@ pub(super) fn stage_and_swap<Reporter: self::Reporter>(
     import_method: PackageImportMethod,
     dir_path: &Path,
     cas_paths: &HashMap<String, PathBuf>,
-    keep_modules_dir: bool,
-    preserve_symlinks: bool,
+    opts: ImportIndexedDirOpts<'_>,
 ) -> Result<(), ImportIndexedDirError> {
+    let ImportIndexedDirOpts {
+        keep_modules_dir,
+        preserve_symlinks,
+        files_check,
+        ..
+    } = opts;
     let paths = StagePaths::new(dir_path);
 
     // 1. Populate the staging directory with the new contents. On
@@ -68,6 +79,7 @@ pub(super) fn stage_and_swap<Reporter: self::Reporter>(
         cas_paths,
         Placement::Fresh,
         preserve_symlinks.then_some(dir_path),
+        files_check,
     ) {
         let _ = fs::remove_dir_all(&paths.stage);
         return Err(error);

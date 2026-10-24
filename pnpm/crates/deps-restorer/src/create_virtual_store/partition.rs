@@ -29,6 +29,11 @@ pub(super) type WarmEntry<'a> = (
 pub(super) struct Partition<'a> {
     pub warm: Vec<WarmEntry<'a>>,
     pub cold: Vec<(&'a PackageKey, &'a SnapshotEntry)>,
+    /// Warm snapshots whose import found a store file stale. They are
+    /// fetched like the cold ones, without the prefetched row, so the
+    /// per-snapshot lookup checks the row's files again and re-fetches
+    /// the package.
+    pub refetch: Vec<(&'a PackageKey, &'a SnapshotEntry)>,
     /// Bundled manifests recovered from the store index, so the bin
     /// linker need not re-read each child's `package.json`.
     pub package_manifests: PackageManifests,
@@ -220,6 +225,7 @@ impl IndexRows {
         Partition {
             warm,
             cold,
+            refetch: Vec::new(),
             package_manifests: self.package_manifests,
             side_effects_maps_by_snapshot: self.side_effects_maps_by_snapshot,
             side_effects_by_snapshot: self.side_effects_by_snapshot,
@@ -228,5 +234,20 @@ impl IndexRows {
             store_index_keys_by_snapshot: self.store_index_keys_by_snapshot,
             requires_build_by_snapshot: self.requires_build_by_snapshot,
         }
+    }
+}
+
+impl<'a> Partition<'a> {
+    /// Move `snapshots` from the warm batch to [`Self::refetch`].
+    pub fn refetch_instead_of_warm(&mut self, snapshots: Vec<(&'a PackageKey, &'a SnapshotEntry)>) {
+        if snapshots.is_empty() {
+            return;
+        }
+        let keys: HashSet<&PackageKey> = snapshots
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        self.warm.retain(|(key, ..)| !keys.contains(key));
+        self.refetch.extend(snapshots);
     }
 }

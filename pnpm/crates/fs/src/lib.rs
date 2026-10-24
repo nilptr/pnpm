@@ -1,5 +1,5 @@
 #[cfg(unix)]
-pub use at_path::AtPath;
+pub use at_path::{AtPath, stat_mtime_ms};
 pub mod file_mode;
 #[cfg(all(windows, feature = "test"))]
 pub mod test_support;

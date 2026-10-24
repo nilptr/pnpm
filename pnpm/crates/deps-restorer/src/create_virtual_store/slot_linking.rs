@@ -2,13 +2,15 @@ use super::{
     ColdCapture, CreateVirtualStoreError, cache_keys::dir_clone_cacheable, removed_aliases_for,
     snapshot_needs_build_marker,
 };
-use crate::InstallPackageBySnapshotError;
+use crate::{CreateVirtualDirError, InstallPackageBySnapshotError};
 use pnpm_lockfile::{PackageKey, PackageMetadata, PkgName, SnapshotEntry};
 use pnpm_reporter::{LogEvent, LogLevel, ProgressLog, ProgressMessage, Reporter};
+use pnpm_store_dir::StoreFilesCheck;
 use pnpm_tarball::{SharedReportedProgressKeys, pending_progress_key};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 pub(super) struct SlotLink<'a> {
@@ -16,6 +18,10 @@ pub(super) struct SlotLink<'a> {
     pub(super) snapshot_key: &'a PackageKey,
     pub(super) snapshot: &'a SnapshotEntry,
     pub(super) cas_paths: &'a HashMap<String, PathBuf>,
+    /// The check of `cas_paths`'s store files, for a warm slot whose row
+    /// the prefetch left unchecked (see
+    /// [`crate::ImportIndexedDirOpts::files_check`]).
+    pub(super) files_check: Option<&'a StoreFilesCheck<'a>>,
     pub(super) warm_cache_key: Option<&'a str>,
     /// Whether the directory-clone cache may serve this slot — see
     /// [`dir_clone_cacheable`].
@@ -42,6 +48,12 @@ pub(super) struct SlotDirGroup<'a> {
 impl SlotDirGroup<'_> {
     pub(super) fn removed_aliases(&self) -> &[PkgName] {
         self.merged_removed_aliases.as_deref().unwrap_or(self.representative.removed_aliases)
+    }
+
+    fn snapshot_keys(&self) -> impl Iterator<Item = &PackageKey> {
+        std::iter::once(self.representative)
+            .chain(self.duplicates.iter().copied())
+            .map(|slot| slot.snapshot_key)
     }
 }
 /// Group `slots` by [`crate::VirtualStoreLayout::slot_dir`], preserving
@@ -131,6 +143,7 @@ pub(super) fn link_cold_chunk<Reporter: self::Reporter>(
                 snapshot_key: capture.snapshot_key,
                 snapshot: capture.snapshot,
                 cas_paths: &capture.cas_paths,
+                files_check: None,
                 warm_cache_key: None,
 
                 dir_clone_cacheable: dir_clone_cacheable(
@@ -144,7 +157,10 @@ pub(super) fn link_cold_chunk<Reporter: self::Reporter>(
             }
         })
         .collect();
-    link_slots_parallel::<Reporter>(LinkSlotsParallel { slots: &cold_slots, ..*template })
+    let stale =
+        link_slots_parallel::<Reporter>(LinkSlotsParallel { slots: &cold_slots, ..*template })?;
+    debug_assert!(stale.is_empty(), "a cold slot imports without a files check");
+    Ok(())
 }
 #[derive(Clone, Copy)]
 pub(super) struct LinkSlotsParallel<'a> {
@@ -157,15 +173,33 @@ pub(super) struct LinkSlotsParallel<'a> {
     pub(super) link_concurrency_probe:
         Option<&'a crate::create_virtual_dir_by_snapshot::tests::LinkConcurrencyProbe>,
 }
+/// Link every slot, returning the snapshot keys of the slots whose import
+/// found a store file stale (see [`SlotLink::files_check`]), which the
+/// caller fetches again. Any other failure fails the pass.
 pub(super) fn link_slots_parallel<Reporter: self::Reporter>(
     opts: LinkSlotsParallel<'_>,
-) -> Result<(), CreateVirtualStoreError> {
+) -> Result<Vec<PackageKey>, CreateVirtualStoreError> {
     use rayon::prelude::*;
 
     let phase_start = std::time::Instant::now();
     let groups = group_slots_by_dir(opts.slots, opts.link.layout);
-    let link_work =
-        || groups.par_iter().try_for_each(|group| link_slot_group::<Reporter>(group, &opts));
+    let stale = Mutex::new(Vec::new());
+    let link_work = || {
+        groups.par_iter().try_for_each(|group| {
+            let Err(error) = link_slot_group::<Reporter>(group, &opts) else { return Ok(()) };
+            let Some(store_file) = stale_store_file(&error) else { return Err(error) };
+            tracing::debug!(
+                target: "pacquet::install",
+                package = %group.representative.snapshot_key,
+                ?store_file,
+                "store file failed its integrity check during import; fetching the package again",
+            );
+            stale.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(group.snapshot_keys().cloned());
+            Ok(())
+        })
+    };
     crate::block_in_place_if_multi_thread(|| crate::link_pool::in_link_pool(link_work))?;
     tracing::info!(
         target: "pacquet::install::phase",
@@ -177,7 +211,19 @@ pub(super) fn link_slots_parallel<Reporter: self::Reporter>(
         "phase complete",
     );
 
-    Ok(())
+    Ok(stale.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// The store file whose failed check stopped a slot's import.
+fn stale_store_file(error: &CreateVirtualStoreError) -> Option<&Path> {
+    match error {
+        CreateVirtualStoreError::InstallPackageBySnapshot(
+            InstallPackageBySnapshotError::CreateVirtualDir(
+                CreateVirtualDirError::ImportIndexedDir(error),
+            ),
+        ) => error.stale_store_file(),
+        _ => None,
+    }
 }
 pub(super) fn link_slot_group<Reporter: self::Reporter>(
     group: &SlotDirGroup<'_>,
@@ -200,6 +246,7 @@ pub(super) fn link_slot_group<Reporter: self::Reporter>(
         source: slot.source,
         layout: opts.link.layout,
         cas_paths: slot.cas_paths,
+        files_check: slot.files_check,
 
         package_id: &package_id,
 
