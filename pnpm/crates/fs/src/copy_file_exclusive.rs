@@ -72,7 +72,8 @@ pub fn copy_file_exclusive(
 ) -> io::Result<()> {
     let mut source = fs::File::open(source_path)?;
     let mut target = create_new_with_permissions(target_path, permissions)?;
-    copy_into_created(&mut source, &mut target, permissions, finish)
+    copy_into_created(&mut source, &mut target, Some(permissions), finish)
+        .map(|_| ())
         .inspect_err(|_| {
             if path_still_names(&target, target_path) {
                 let _ = fs::remove_file(target_path);
@@ -82,16 +83,23 @@ pub fn copy_file_exclusive(
 
 /// The copy of [`copy_file_exclusive`] once both files are open: the
 /// bytes, then `permissions` asserted through `target`'s handle, then
-/// `finish`. The caller created `target` and removes it on failure.
+/// `finish`. Returns the number of bytes copied. The caller created
+/// `target` and removes it on failure.
+///
+/// `permissions` is `None` when `target` was created at a mode the
+/// umask cannot narrow, which leaves nothing to assert.
 pub fn copy_into_created(
-    source: &mut fs::File,
+    source: &mut impl io::Read,
     target: &mut fs::File,
-    permissions: &CopyPermissions,
+    permissions: Option<&CopyPermissions>,
     finish: impl FnOnce(&fs::File) -> io::Result<()>,
-) -> io::Result<()> {
-    io::copy(source, target)
-        .and_then(|_| set_file_permissions(target, permissions))
-        .and_then(|()| finish(target))
+) -> io::Result<u64> {
+    let copied = io::copy(source, target)?;
+    if let Some(permissions) = permissions {
+        set_file_permissions(target, permissions)?;
+    }
+    finish(target)?;
+    Ok(copied)
 }
 
 /// Copy `source_path` to `target_path`, so that a reader of the target

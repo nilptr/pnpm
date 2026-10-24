@@ -273,3 +273,38 @@ fn an_import_reports_a_stale_or_missing_store_file_for_the_caller_to_fetch_again
     let error = import_fresh(&unchecked).unwrap_err();
     assert!(matches!(error, LinkFileError::Import { .. }), "{error}");
 }
+
+#[test]
+fn a_copy_of_a_checked_store_file_is_complete_at_the_desired_mode() {
+    let fixture = Fixture::new();
+    fixture.set_source_mode(0o600);
+    let recorded = fixture.recorded(Some(now_ms()));
+    let files = recorded.check();
+
+    fixture
+        .import_checked(&fixture.source_path, files.file(&fixture.source_path))
+        .copy()
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(fixture.target()).unwrap(), "content");
+    assert_eq!(mode_of(&fixture.target()), desired_mode());
+}
+
+/// The row records a size other than the file's, so the copy cannot
+/// trust it as the length and reads to the end of the file instead.
+#[test]
+fn a_copy_of_a_store_file_whose_size_disagrees_with_its_row_is_still_complete() {
+    let fixture = Fixture::new();
+    let recorded = RecordedStoreFiles::new(
+        &fixture.root.path().join("store"),
+        &[("index.js", &fixture.source_path, 3, Some(now_ms()))],
+    );
+    let files = recorded.check();
+
+    fixture
+        .import_checked(&fixture.source_path, files.file(&fixture.source_path))
+        .copy()
+        .unwrap();
+
+    assert_eq!(fs::read_to_string(fixture.target()).unwrap(), "content");
+}

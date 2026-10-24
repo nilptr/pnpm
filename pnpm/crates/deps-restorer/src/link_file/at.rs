@@ -2,7 +2,7 @@
 //! resolves only the path below its directory, not its full path.
 
 use super::{
-    FileImport,
+    FileImport, stale_store_file,
     target_mode::{desired_mode, mode_is_linkable},
     verify_store_file,
 };
@@ -14,7 +14,8 @@ use pnpm_fs::{
 use pnpm_store_dir::StoreFileCheck;
 use rustix::fs::{AtFlags, Stat};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Read},
     os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -174,16 +175,43 @@ impl FileImport for AtImport<'_> {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    /// A store entry's desired mode already leaves out the umask's bits,
+    /// so the mode the target is created at is final; only a file outside
+    /// the store has its mode asserted after the copy. A store entry
+    /// whose size the row records is copied in one pass of that length,
+    /// without a read that finds the end of the file.
     fn copy(&self) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let mut source = fs::File::from(self.source.open_read()?);
+        let source = fs::File::from(self.source.open_read()?);
         let stat = rustix::fs::fstat(&source)?;
         self.verify(&stat)?;
         let mode = self.copy_mode(&stat);
         let mut target = fs::File::from(self.target.create_new(mode)?);
-        let permissions = fs::Permissions::from_mode(mode);
-        pnpm_fs::copy_into_created(&mut source, &mut target, &permissions, |_| Ok(()))
-            .inspect_err(|_| self.remove_created(&target))
+        let permissions =
+            desired_mode(self.source_path).is_none().then(|| fs::Permissions::from_mode(mode));
+        let recorded_size = self.check
+            .map(|check| check.size())
+            .filter(|size| u64::try_from(stat.st_size).is_ok_and(|actual| actual == *size));
+        let copied = match recorded_size {
+            Some(size) => pnpm_fs::copy_into_created(
+                &mut (&source).take(size),
+                &mut target,
+                permissions.as_ref(),
+                |_| Ok(()),
+            ),
+            None => {
+                pnpm_fs::copy_into_created(&mut &source, &mut target, permissions.as_ref(), |_| {
+                    Ok(())
+                })
+            }
+        }
+        .inspect_err(|_| self.remove_created(&target))?;
+        if recorded_size.is_some_and(|size| copied != size) {
+            // The source lost bytes while it was read.
+            self.remove_created(&target);
+            return Err(stale_store_file());
+        }
+        Ok(())
     }
 
     /// `clonefile` gives the clone the source's mode. Elsewhere the clone

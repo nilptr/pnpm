@@ -1,8 +1,8 @@
 #[cfg(unix)]
 use super::path_still_names;
-use super::{copy_file_atomic, copy_file_exclusive};
+use super::{copy_file_atomic, copy_file_exclusive, copy_into_created};
 use std::{fs, io, path::Path};
-use tempfile::TempDir;
+use tempfile::{TempDir, tempdir};
 
 fn source_permissions(path: &Path) -> fs::Permissions {
     fs::File::open(path)
@@ -147,4 +147,35 @@ fn copy_file_atomic_leaves_no_temp_file_when_the_source_is_missing() {
 
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0, "no temp file survives");
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_into_created_keeps_the_creation_mode_when_given_no_permissions() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("source");
+    fs::write(&source_path, b"payload").unwrap();
+    let target_path = dir.path().join("target");
+    let mut source = fs::File::open(&source_path).unwrap();
+    let mut target = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&target_path)
+        .unwrap();
+
+    let copied = copy_into_created(&mut source, &mut target, None, |_| Ok(())).unwrap();
+
+    assert_eq!(copied, 7);
+    assert_eq!(fs::read(&target_path).unwrap(), b"payload");
+    assert_eq!(
+        fs::metadata(&target_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
